@@ -6,3 +6,4 @@ Type description here
  - Team Member 2
 
 ## Full Project Idea
+new text added
