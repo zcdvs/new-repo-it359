@@ -2,8 +2,8 @@
 Type description here
 
 ## Team Members
- - Team Member 1
- - Team Member 2
+ - Zac Davis
+ - Caleb Clauson
 
 ## Full Project Idea
 new text added
