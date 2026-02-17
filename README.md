@@ -102,7 +102,7 @@ Uses ML/AI to identify fileless malware:
 | Red Team | PowerShell 5.1+, Python 3.8+ |
 | Blue Team | Python 3.8+, scikit-learn, psutil |
 | Communication | HTTP/HTTPS, Flask |
-| ML/AI | scikit-learn, numpy, pandas |
+| ML/AI | scikit-learn, numpy, pandas, sushi |
 
 ---
 
