@@ -1,0 +1,15 @@
+# IT 359 Final Project - Python Dependencies
+
+# Web server for C2 listener
+flask>=2.0.0
+
+# Machine learning dependencies
+scikit-learn>=1.0.0
+numpy>=1.21.0
+pandas>=1.3.0
+
+# System monitoring (for detection)
+psutil>=5.8.0
+
+# HTTP requests
+requests>=2.26.0
