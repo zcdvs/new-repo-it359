@@ -135,6 +135,8 @@ function Send-Beacon {
     }
 }
 
+# End of Send-Beacon function
+
 # ============================================
 # TECHNIQUE 3: IN-MEMORY CODE EXECUTION
 # Execute code from string without file
@@ -144,15 +146,15 @@ function Invoke-MemoryExecution {
     
     # Code stored as string, executed via Invoke-Expression
     # This is how fileless malware often downloads and runs payloads
-    $inMemoryScript = @'
-    $result = @{
+    $inMemoryScript = @"
+    `$result = @{
         Technique = "In-Memory Execution"
-        ProcessId = $PID
+        ProcessId = `$PID
         ExecutionTime = Get-Date -Format "HH:mm:ss"
         Note = "This code was never written to disk"
     }
-    return $result
-'@
+    return `$result
+"@
     
     if ($DemoMode) {
         Write-Host "    [*] Executing script block from memory..." -ForegroundColor Gray
