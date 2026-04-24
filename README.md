@@ -24,8 +24,9 @@ This project provides hands-on experience with both offensive (Red Team) and def
 ## Project Structure
 
 ```
-├── README.md
-├── requirements.txt
+└── docs/
+    ├── project_overview.md
+    └── setup_guide.md
 ├── src/
 │   ├── red_team/              # Offensive tools
 │   │   ├── fileless_simulation.ps1   # PowerShell malware simulation
@@ -33,9 +34,12 @@ This project provides hands-on experience with both offensive (Red Team) and def
 │   └── blue_team/             # Defensive tools
 │       ├── detector.py               # Behavior-based detection
 │       └── ml_detector.py            # ML-based detection
-└── docs/
-    ├── project_overview.md
-    └── setup_guide.md
+├── .env
+├── .gitignore
+├── README.md
+├── example-ai-api-usage.js
+├── requirements.txt
+
 ```
 
 ---
