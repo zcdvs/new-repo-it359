@@ -33,7 +33,7 @@ DEFAULT_C2_PORT = 8080
 
 # OpenWebUI / Sushi AI defaults
 DEFAULT_AI_BASE_URL = "http://sushi.it.ilstu.edu:8080"
-DEFAULT_MODEL_NAME = "translategemma:latest"  # replace if your instructor suggests another
+DEFAULT_MODEL_NAME = "translategemma:latest"
 
 
 SUSPICIOUS_POWERSHELL_PATTERNS: List[re.Pattern[str]] = [
