@@ -36,8 +36,8 @@ This project provides hands-on experience with both offensive (Red Team) and def
 │       └── ml_detector.py            # ML-based detection
 ├── .env
 ├── .gitignore
-├── README.md
 ├── example-ai-api-usage.js
+├── README.md
 ├── requirements.txt
 
 ```
@@ -106,7 +106,7 @@ Uses ML/AI to identify fileless malware:
 | Red Team | PowerShell 5.1+, Python 3.8+ |
 | Blue Team | Python 3.8+, scikit-learn, psutil |
 | Communication | HTTP/HTTPS, Flask |
-| ML/AI | scikit-learn, numpy, pandas |
+| ML/AI | Sushi Server API |
 
 ---
 
