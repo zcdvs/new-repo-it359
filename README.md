@@ -130,6 +130,14 @@ source venv/bin/activate  # macOS/Linux
 
 # Install dependencies
 pip install -r requirements.txt
+
+# Set the GEMINI_API_KEY environment variable
+~/.bashrc # Check if you have a configuration file for it
+touch ~/.bashrc # If the previous command resulted in 'No such file or directory'
+open ~/.bashrc
+# Add the following to the file
+# export GEMINI_API_KEY=<YOUR_API_KEY_HERE>
+source ~/.bashrc
 ```
 
 ---
