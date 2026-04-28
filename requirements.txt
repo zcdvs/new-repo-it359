@@ -13,3 +13,6 @@ psutil>=5.8.0
 
 # HTTP requests
 requests>=2.26.0
+
+# Google Gemini API
+google-genai>=0.1.0
