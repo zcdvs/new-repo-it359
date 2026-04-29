@@ -95,7 +95,7 @@ def detect_suspicious_cmdline(proc: psutil.Process) -> Optional[Detection]:
 def detect_c2_connections(proc: psutil.Process, c2_host: str, c2_port: int) -> Optional[Detection]:
     """Detect if the process is connecting to the configured C2 host/port."""
     try:
-        conns = proc.connections(kind="inet")  # type: ignore[arg-type]
+        conns = proc.net_connections(kind="inet")  # type: ignore[arg-type]
     except (psutil.NoSuchProcess, psutil.AccessDenied):
         return None
 
