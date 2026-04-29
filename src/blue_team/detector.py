@@ -138,7 +138,7 @@ def print_detection(det: Detection) -> None:
     print()
 
 
-def monitor(c2_host: str, c2_port: int, interval: float = 5.0) -> None:
+def monitor(c2_host: str, c2_port: int, interval: float = 5.0, debug: bool = False) -> None:
     """Continuously monitor for suspicious behavior.
 
     - Looks for suspicious PowerShell command lines
@@ -149,14 +149,24 @@ def monitor(c2_host: str, c2_port: int, interval: float = 5.0) -> None:
     print(f"[*] Monitoring for suspicious PowerShell activity...")
     print(f"[*] C2 target: {c2_host}:{c2_port} (host='*' means any IP on port {c2_port})")
     print(f"[*] Poll interval: {interval} seconds")
+    if debug:
+        print(f"[*] DEBUG MODE: ON (verbose output enabled)")
     print("[*] Press Ctrl+C to stop.\n")
 
     seen: Dict[int, str] = {}
+    debug_count = 0
 
     try:
         while True:
+            debug_count += 1
+            powershell_procs = []
+            
             for proc in iter_processes():
                 cmdline = get_cmdline(proc)
+                
+                # Track PowerShell processes for debug output
+                if is_powershell_process(proc):
+                    powershell_procs.append((proc.pid, proc.name(), cmdline))
                 
                 # 1) Suspicious PowerShell command line
                 det1 = detect_suspicious_cmdline(proc)
@@ -175,6 +185,14 @@ def monitor(c2_host: str, c2_port: int, interval: float = 5.0) -> None:
                         print_detection(det2)
                         seen[proc.pid] = cmdline
                     continue
+            
+            # Debug output: show PowerShell processes found
+            if debug and debug_count % 3 == 0:  # Print every 3rd iteration to reduce spam
+                if powershell_procs:
+                    print(f"\n[DEBUG] Found {len(powershell_procs)} PowerShell process(es):")
+                    for pid, name, cmd in powershell_procs:
+                        print(f"  - PID {pid} ({name}): {cmd[:80]}..." if len(cmd) > 80 else f"  - PID {pid} ({name}): {cmd}")
+                    print()
 
             time.sleep(interval)
     except KeyboardInterrupt:
@@ -186,6 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--c2-host", default=DEFAULT_C2_HOST, help="C2 host/IP to watch (use '*' for any IP, default: 127.0.0.1)")
     parser.add_argument("--c2-port", type=int, default=DEFAULT_C2_PORT, help="C2 port to watch (default: 8080)")
     parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds (default: 5.0)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug output to see all PowerShell processes")
     return parser.parse_args()
 
 
@@ -199,7 +218,7 @@ def main() -> None:
         print(f"[!] psutil error: {exc}")
         sys.exit(1)
 
-    monitor(c2_host=args.c2_host, c2_port=args.c2_port, interval=args.interval)
+    monitor(c2_host=args.c2_host, c2_port=args.c2_port, interval=args.interval, debug=args.debug)
 
 
 if __name__ == "__main__":
