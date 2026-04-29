@@ -483,7 +483,7 @@ function Show-WMIEventSub {
     $WmiNamespace = "root\subscription"
     $desktopPath = [Environment]::GetFolderPath('Desktop')
 
-    # If running in Live mode, ensure required persistent WMI helper cmdlets exist.
+    # If running in Live mode, prefer helper cmdlets but fall back to WMI-class creation if cmdlets are missing.
     if (-not $Global:DemoMode) {
         $required = @('New-WmiEventFilter','New-WmiEventConsumer','Register-WmiEventSubscriber','Unregister-WmiEventSubscriber')
         $missing = @()
@@ -494,9 +494,23 @@ function Show-WMIEventSub {
         }
         if ($missing.Count -gt 0) {
             Write-Warning "Persistent WMI subscription cmdlets not available: $($missing -join ', ')."
-            Write-Warning "Run this demo in Windows PowerShell 5.1 (powershell.exe) or install a module providing these cmdlets."
-            Write-Host "    [*] Skipping live WMI subscription due to missing cmdlets." -ForegroundColor Yellow
-            return
+            # Detect whether WMI class-based creation is possible (fallback)
+            $canUseWmiClasses = $false
+            try {
+                $testClass = [wmiclass]"\\.\$WmiNamespace:__EventFilter"
+                $canUseWmiClasses = $true
+            }
+            catch {
+                $canUseWmiClasses = $false
+            }
+            if ($canUseWmiClasses) {
+                Write-Host "    [*] Helper cmdlets missing but WMI class creation is available; proceeding with class-based fallback." -ForegroundColor Yellow
+            }
+            else {
+                Write-Warning "Run this demo in Windows PowerShell 5.1 (powershell.exe) or install a module providing these cmdlets."
+                Write-Host "    [*] Skipping live WMI subscription due to missing cmdlets and no class fallback." -ForegroundColor Yellow
+                return
+            }
         }
     }
 
