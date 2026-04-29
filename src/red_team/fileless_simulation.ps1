@@ -247,11 +247,32 @@ return $result
 # ==========================================================================
 function Set-EnvPayload {
     Write-Host "[+] Technique 4: Environment Variable Payload Storage" -ForegroundColor Green
-    
-    # Define a more visible payload: get system info and log it to a file.
-    $payload = 'Add-Content -Path "C:\temp\execution_marker.txt" -Value "Payload executed by user: $(whoami)"'
+
+    $tempDir = 'C:\temp'
+
+    # Ensure temp dir exists in Live mode (Demo mode only logs)
+    if ($Global:DemoMode) {
+        Write-Host "    [*] Would ensure folder exists: $tempDir (LOGGING ONLY)" -ForegroundColor Gray
+    }
+    else {
+        if (-not (Test-Path -Path $tempDir)) {
+            try {
+                New-Item -Path $tempDir -ItemType Directory -Force -ErrorAction Stop | Out-Null
+                Write-Host "    [OK] Created folder $tempDir" -ForegroundColor Green
+            }
+            catch {
+                Write-Error "    [!] Failed to create folder ${tempDir}: $($_.Exception.Message)"
+            }
+        }
+        else {
+            Write-Host "    [*] Folder exists: $tempDir" -ForegroundColor Gray
+        }
+    }
+
+    # Build payload that writes a marker file under the chosen temp dir.
+    $payload = 'Add-Content -Path "' + $tempDir + '\\execution_marker.txt" -Value "Payload executed by user: $(whoami)"'
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
-    
+
     # Store in environment variable (process-level, not persistent)
     [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $encodedPayload, "Process")
 
@@ -271,7 +292,13 @@ function Set-EnvPayload {
         }
         else {
             Write-Host "    [LIVE] Executing payload from environment variable..." -ForegroundColor Green
-            Invoke-Expression $decoded
+            try {
+                Invoke-Expression $decoded
+                Write-Host "    [OK] Payload executed." -ForegroundColor Green
+            }
+            catch {
+                Write-Error "    [!] Payload execution failed: $($_.Exception.Message)"
+            }
         }
     }
     else {
@@ -336,10 +363,13 @@ function Undo-LiveChanges {
     $regKeyName = 'DemoApp'
     $file = 'C:\temp\execution_marker.txt'
     $dir = 'C:\temp'
+    $desktopPath = [Environment]::GetFolderPath('Desktop')
+    $desktopFile = Join-Path -Path $desktopPath -ChildPath 'HI.txt'
 
     if ($Global:DemoMode) {
         Write-Host "    [DEMO] Would remove registry value: $registryPath\$regKeyName" -ForegroundColor Yellow
         Write-Host "    [DEMO] Would remove file: $file" -ForegroundColor Yellow
+        Write-Host "    [DEMO] Would remove desktop file: $desktopFile" -ForegroundColor Yellow
         Write-Host "    [DEMO] Would remove folder (if empty): $dir" -ForegroundColor Yellow
         return
     }
@@ -357,6 +387,20 @@ function Undo-LiveChanges {
     }
     catch {
         Write-Error "    [!] Failed to remove registry value: $($_.Exception.Message)"
+    }
+
+    # Remove desktop file if present
+    if (Test-Path -Path $desktopFile) {
+        try {
+            Remove-Item -Path $desktopFile -Force -ErrorAction Stop
+            Write-Host "    [OK] Removed desktop file: $desktopFile" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "    [!] Failed to remove desktop file: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Host "    [*] Desktop file not found: $desktopFile" -ForegroundColor Gray
     }
 
     # Remove file if exists
