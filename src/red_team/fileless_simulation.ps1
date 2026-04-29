@@ -32,7 +32,7 @@
 .PARAMETER LiveMode
     If set to $true, the script WILL ACTUATE the system, making changes
     in memory, registry, and network calls.
-#>
+
 .PARAMETER C2Server
     The IP address or hostname of your Command and Control (C2) server.
     
