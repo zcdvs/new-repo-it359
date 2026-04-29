@@ -43,6 +43,7 @@ param(
     [switch]$Verbose,
     [switch]$DemoMode,
     [switch]$LiveMode,
+    [switch]$Undo,
     [string]$C2Server = '10.0.0.249',
     [int]$C2Port = 8080
 )
@@ -51,14 +52,17 @@ param(
 if (-not $PSBoundParameters.ContainsKey('DemoMode')) { $DemoMode = $true }
 if (-not $PSBoundParameters.ContainsKey('Verbose'))  { $Verbose = $false }
 if (-not $PSBoundParameters.ContainsKey('LiveMode'))  { $LiveMode = $false }
+if (-not $PSBoundParameters.ContainsKey('Undo'))      { $Undo = $false }
 # Global State
 $Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
 $Global:C2Url = "http://${C2Server}:${C2Port}"
 # Normalize and assign mode switches (ensure booleans)
 $DemoMode = [bool]$DemoMode
 $LiveMode = [bool]$LiveMode
+$Undo = [bool]$Undo
 $Global:DemoMode = $DemoMode
 $Global:LiveMode = $LiveMode
+$Global:Undo = $Undo
 
 # ===========================================================================
 # SETUP AND HELPER FUNCTIONS
@@ -327,6 +331,70 @@ function Show-RegistryPersistence {
     }
 }
 
+function Undo-LiveChanges {
+    Write-Host "[*] Undo requested: reverting live changes" -ForegroundColor Cyan
+
+    $registryPath = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+    $regKeyName = 'DemoApp'
+    $file = 'C:\temp\execution_marker.txt'
+    $dir = 'C:\temp'
+
+    if ($Global:DemoMode) {
+        Write-Host "    [DEMO] Would remove registry value: $registryPath\$regKeyName" -ForegroundColor Yellow
+        Write-Host "    [DEMO] Would remove file: $file" -ForegroundColor Yellow
+        Write-Host "    [DEMO] Would remove folder (if empty): $dir" -ForegroundColor Yellow
+        return
+    }
+
+    # Remove registry value if present
+    try {
+        $val = Get-ItemProperty -Path $registryPath -Name $regKeyName -ErrorAction SilentlyContinue
+        if ($null -ne $val) {
+            Remove-ItemProperty -Path $registryPath -Name $regKeyName -ErrorAction Stop
+            Write-Host "    [OK] Removed registry value: $registryPath\$regKeyName" -ForegroundColor Green
+        }
+        else {
+            Write-Host "    [*] Registry value not found: $registryPath\$regKeyName" -ForegroundColor Gray
+        }
+    }
+    catch {
+        Write-Error "    [!] Failed to remove registry value: $($_.Exception.Message)"
+    }
+
+    # Remove file if exists
+    if (Test-Path -Path $file) {
+        try {
+            Remove-Item -Path $file -Force -ErrorAction Stop
+            Write-Host "    [OK] Removed file: $file" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "    [!] Failed to remove file ${file}: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Host "    [*] File not found: $file" -ForegroundColor Gray
+    }
+
+    # Remove directory if empty
+    if (Test-Path -Path $dir) {
+        try {
+            $count = (Get-ChildItem -Path $dir -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+            if ($count -eq 0) {
+                Remove-Item -Path $dir -Force -ErrorAction Stop
+                Write-Host "    [OK] Removed empty folder: $dir" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    [*] Folder not empty, leaving: $dir" -ForegroundColor Gray
+            }
+        }
+        catch {
+            Write-Error "    [!] Failed to remove folder ${dir}: $($_.Exception.Message)"
+        }
+    }
+
+    Write-Host "[*] Undo complete." -ForegroundColor Cyan
+}
+
 function Show-WMIEventSub {
     Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
 
@@ -433,6 +501,15 @@ function Start-Simulation {
 # ==========================================================================
 # SCRIPT ENTRY POINT
 # ==========================================================================
+
+# Check for Undo first
+if ($Global:Undo) {
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Write-Host "           UNDO MODE ACTIVE" -ForegroundColor Yellow
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Undo-LiveChanges
+    exit 0
+}
 
 # Check parameters and start
 if ($Global:LiveMode) {
