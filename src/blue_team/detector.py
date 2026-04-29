@@ -156,25 +156,24 @@ def monitor(c2_host: str, c2_port: int, interval: float = 5.0) -> None:
     try:
         while True:
             for proc in iter_processes():
-                # Skip already seen benign processes (by PID and cmdline string)
                 cmdline = get_cmdline(proc)
-                key = (proc.pid, cmdline)
-                cache_val = seen.get(proc.pid)
-                if cache_val == cmdline:
-                    continue
-
+                
                 # 1) Suspicious PowerShell command line
                 det1 = detect_suspicious_cmdline(proc)
                 if det1:
-                    print_detection(det1)
-                    seen[proc.pid] = det1.cmdline
+                    # Only print if this is a new detection for this process
+                    if seen.get(proc.pid) != cmdline:
+                        print_detection(det1)
+                        seen[proc.pid] = cmdline
                     continue
 
                 # 2) Connection to C2
                 det2 = detect_c2_connections(proc, c2_host=c2_host, c2_port=c2_port)
                 if det2:
-                    print_detection(det2)
-                    seen[proc.pid] = det2.cmdline
+                    # Only print if this is a new detection for this process
+                    if seen.get(proc.pid) != cmdline:
+                        print_detection(det2)
+                        seen[proc.pid] = cmdline
                     continue
 
             time.sleep(interval)
