@@ -61,10 +61,17 @@ $Global:LiveMode = $false
 # SETUP AND HELPER FUNCTIONS
 # ==========================================================================
 
-# Check for required modules
-if (-not (Get-Module -Name Invoke-WebRequests -ListAvailable)) {
-    Write-Warning "The 'Invoke-WebRequests' module is required. Please install it."
-    Write-Host "Install with: Install-Module Invoke-RestMethod" -ForegroundColor Red
+# Check for required cmdlets (these are built-in to PowerShell)
+$missing = @()
+if (-not (Get-Command -Name Invoke-RestMethod -ErrorAction SilentlyContinue)) {
+    $missing += 'Invoke-RestMethod'
+}
+if (-not (Get-Command -Name Invoke-WebRequest -ErrorAction SilentlyContinue)) {
+    $missing += 'Invoke-WebRequest'
+}
+if ($missing.Count -gt 0) {
+    Write-Warning "Required cmdlets missing: $($missing -join ', ')"
+    Write-Host "Ensure you're running a full PowerShell (Windows PowerShell or PowerShell Core). These cmdlets are built-in; no module installation should be necessary." -ForegroundColor Red
     exit 1
 }
 
@@ -197,16 +204,16 @@ function Send-Beacon {
 function Invoke-MemoryExecution {
     Write-Host "[+] Technique 3: In-Memory Code Execution" -ForegroundColor Green
     
-    # Code stored as string, executed via Invoke-Expression
-    $inMemoryScript = @"
-    \$result = @{
-        Technique = "In-Memory Execution"
-        ProcessId = \$PID
-        ExecutionTime = Get-Date -Format "HH:mm:ss"
-        Note = "This code was never written to disk"
-    }
-    return \$result
-"@
+    # Code stored as string, executed via ScriptBlock creation
+    $inMemoryScript = @'
+$result = @{
+    Technique = "In-Memory Execution"
+    ProcessId = $PID
+    ExecutionTime = Get-Date -Format "HH:mm:ss"
+    Note = "This code was never written to disk"
+}
+return $result
+'@
     
     if ($Global:DemoMode) {
         Write-Host "    [*] Executing script block from memory..." -ForegroundColor Gray
@@ -269,6 +276,37 @@ function Set-EnvPayload {
 # ==========================================================================
 # TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
 # ==========================================================================
+function Show-RegistryPersistence {
+    Write-Host "[+] Technique 5: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
+
+    if ($Global:DemoMode) {
+        Write-Host "    [*] Demonstrating registry-based persistence concepts:" -ForegroundColor Gray
+        Write-Host "    [*] - HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -ForegroundColor Gray
+        Write-Host "    [*] - Values here run commands at user logon" -ForegroundColor Gray
+        Write-Host "" 
+        Write-Host "    [DEMO] Example commands (not executed):" -ForegroundColor Yellow
+        Write-Host "    Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp' -Value 'powershell.exe -WindowStyle Hidden -EncodedCommand <base64>'" -ForegroundColor DarkGray
+        Write-Host "    Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp'" -ForegroundColor DarkGray
+        Write-Host "" 
+        Write-Host "    [DEMO] Blue Team should monitor Run keys for suspicious entries." -ForegroundColor Yellow
+    }
+}
+
+function Show-WMIEventSub {
+    Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
+
+    if ($Global:DemoMode) {
+        Write-Host "    [*] WMI subscriptions allow code execution without files:" -ForegroundColor Gray
+        Write-Host "    [*] - Event Filter: Defines trigger condition" -ForegroundColor Gray
+        Write-Host "    [*] - Event Consumer: Defines action (PowerShell command)" -ForegroundColor Gray
+        Write-Host "" 
+        Write-Host "    [DEMO] Example command that WOULD be used (not executed):" -ForegroundColor Yellow
+        Write-Host "    $EventFilter = New-WmiEventFilter -Name 'EventSubscription' -Query 'SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA \\"Win32_Process\\"'" -ForegroundColor DarkGray
+        Write-Host "    $EventConsumer = New-WmiEventConsumer -Name 'EventSubscription' -ScriptText 'powershell.exe -EncodedCommand <base64_payload>'" -ForegroundColor DarkGray
+        Write-Host "" 
+        Write-Host "    [DEMO] This technique is a key detection target for Blue Team!" -ForegroundColor Yellow
+    }
+}
 function Show-ProcessHollowing {
     Write-Host "[+] Technique 7: Process Hollowing Concept" -ForegroundColor Green
     
