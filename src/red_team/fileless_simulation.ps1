@@ -160,7 +160,8 @@ function Invoke-MemoryExecution {
         Write-Host "    [*] Script never touches disk - runs directly from RAM" -ForegroundColor Gray
     }
     
-    # Execute the in-memory script
+    # Execute the in-memory script by creating a ScriptBlock from the string
+    $scriptBlock = [ScriptBlock]::Create($inMemoryScript)
     $result = & $scriptBlock
     
     if ($DemoMode) {
@@ -189,17 +190,40 @@ function Set-EnvPayload {
         Write-Host "    [*] Encoded payload length: $($encodedPayload.Length) chars" -ForegroundColor Gray
     }
     
-    # Retrieve and execute
-    $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($retrieved))
-    
-    if ($DemoMode) {
-        Write-Host "    [*] Executing payload from environment variable..." -ForegroundColor Gray
-        Invoke-Expression $decoded
+    # Retrieve and execute (safe)
+    $retrieved = [Environment]::GetEnvironmentVariable("DEMO_PAYLOAD", "Process")
+    if ($retrieved) {
+        $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($retrieved))
+        if ($DemoMode) {
+            Write-Host "    [*] Executing payload from environment variable..." -ForegroundColor Gray
+            Invoke-Expression $decoded
+        }
     }
-    
+    else {
+        if ($DemoMode) {
+            Write-Host "    [!] No payload found in environment variable 'DEMO_PAYLOAD'." -ForegroundColor Yellow
+        }
+    }
+
     # Clean up
     [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $null, "Process")
     Write-Host "    [OK] Environment variable cleaned up" -ForegroundColor Green
+}
+
+function Show-RegistryPersistence {
+    Write-Host "[+] Technique 5: Registry-Based Persistence (DEMO ONLY - Not Executed)" -ForegroundColor Green
+
+    if ($DemoMode) {
+        Write-Host "    [*] Demonstrating registry-based persistence concepts:" -ForegroundColor Gray
+        Write-Host "    [*] - HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run" -ForegroundColor Gray
+        Write-Host "    [*] - Values here run commands at user logon" -ForegroundColor Gray
+        Write-Host "" 
+        Write-Host "    [DEMO] Example commands (not executed):" -ForegroundColor Yellow
+        Write-Host "    Set-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp' -Value 'powershell.exe -WindowStyle Hidden -EncodedCommand <base64>'" -ForegroundColor DarkGray
+        Write-Host "    Remove-ItemProperty -Path 'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Run' -Name 'MyApp'" -ForegroundColor DarkGray
+        Write-Host "" 
+        Write-Host "    [DEMO] Blue Team should monitor Run keys for suspicious entries." -ForegroundColor Yellow
+    }
 }
 
 # ======================================================================
