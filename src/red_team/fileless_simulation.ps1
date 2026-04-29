@@ -237,11 +237,16 @@ return $result
 # TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
 # Store payload in env vars (process-level, not persistent)
 # ==========================================================================
+# ==========================================================================
+# TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
+# Store payload in env vars (process-level, not persistent)
+# ============================================================================
 function Set-EnvPayload {
     Write-Host "[+] Technique 4: Environment Variable Payload Storage" -ForegroundColor Green
     
-    # Encode a payload and store in env var (process-level, not persistent)
-    $payload = "Write-Host 'Payload executed from environment variable!' -ForegroundColor Magenta"
+    # Define a more complex payload that executes a command and shows its effect.
+    # This payload will add a visible line to the console output.
+    $payload = "Add-Content -Path \"C:\temp\execution_marker.txt\" -Value 'Successfully executed payload via Env Var.'"
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
     
     if ($Global:DemoMode) {
@@ -272,6 +277,7 @@ function Set-EnvPayload {
     [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $null, "Process")
     Write-Host "    [OK] Environment variable cleaned up." -ForegroundColor Green
 }
+
 
 # ==========================================================================
 # TECHNIQUE 7: PROCESS HOLLOWING CONCEPT
