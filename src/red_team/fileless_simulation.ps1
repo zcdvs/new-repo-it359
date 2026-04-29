@@ -233,44 +233,43 @@ return $result
     return $result
 }
 
+
 # ==========================================================================
 # TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
 # Store payload in env vars (process-level, not persistent)
 # ==========================================================================
-# ==========================================================================
-# TECHNIQUE 4: ENVIRONMENT VARIABLE ABUSE
-# Store payload in env vars (process-level, not persistent)
-# ============================================================================
 function Set-EnvPayload {
     Write-Host "[+] Technique 4: Environment Variable Payload Storage" -ForegroundColor Green
-    
-    # Define a more complex payload that executes a command and shows its effect.
-    # This payload will add a visible line to the console output.
-    $payload = "Add-Content -Path \"C:\temp\execution_marker.txt\" -Value 'Successfully executed payload via Env Var.'"
+
+    # Define a payload command. Use single quotes for the outer string
+    # so inner double-quotes around the path/value are preserved.
+    $payload = 'Add-Content -Path "C:\temp\execution_marker.txt" -Value "Successfully executed payload via Env Var."'
     $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
-    
+
+    # Store in environment variable (process-level, not persistent)
+    [Environment]::SetEnvironmentVariable("DEMO_PAYLOAD", $encodedPayload, "Process")
+
     if ($Global:DemoMode) {
         Write-Host "    [*] Payload stored in env var: DEMO_PAYLOAD" -ForegroundColor Gray
         Write-Host "    [*] Encoded payload length: $($encodedPayload.Length) chars" -ForegroundColor Gray
     }
-    
-    # Retrieve and execute (safe)
+
+    # Retrieve and decode
     $retrieved = [Environment]::GetEnvironmentVariable("DEMO_PAYLOAD", "Process")
     if ($retrieved) {
         $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($retrieved))
-        
+
         if ($Global:DemoMode) {
-            Write-Host "    [*] Executing payload from environment variable..." -ForegroundColor Gray
-            Invoke-Expression $decoded
-        } else {
+            Write-Host "    [*] (DEMO) Decoded payload: $decoded" -ForegroundColor Gray
+            Write-Host "    [*] Not executing payload in Demo Mode." -ForegroundColor Yellow
+        }
+        else {
             Write-Host "    [LIVE] Executing payload from environment variable..." -ForegroundColor Green
             Invoke-Expression $decoded
         }
     }
     else {
-        if ($Global:DemoMode) {
-            Write-Host "    [!] No payload found in env var 'DEMO_PAYLOAD'." -ForegroundColor Yellow
-        }
+        Write-Host "    [!] No payload found in env var 'DEMO_PAYLOAD'." -ForegroundColor Yellow
     }
 
     # Clean up
