@@ -40,12 +40,17 @@
     The port number of your C2 server.
 #>
 param(
-    [switch]$Verbose = $false,
-    [switch]$DemoMode = $true,
-    [switch]$LiveMode = $false,
-    [string]$C2Server = "10.0.0.249",
+    [switch]$Verbose,
+    [switch]$DemoMode,
+    [switch]$LiveMode,
+    [string]$C2Server = '10.0.0.249',
     [int]$C2Port = 8080
 )
+
+# Set defaults for switches when they were not explicitly provided
+if (-not $PSBoundParameters.ContainsKey('DemoMode')) { $DemoMode = $true }
+if (-not $PSBoundParameters.ContainsKey('Verbose'))  { $Verbose = $false }
+if (-not $PSBoundParameters.ContainsKey('LiveMode'))  { $LiveMode = $false }
 # Global State
 $Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
 $Global:C2Url = "http://${C2Server}:${C2Port}"
