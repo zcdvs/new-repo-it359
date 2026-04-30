@@ -21,8 +21,34 @@
     
     Authors: Zac Davis, Caleb Clauson
     Course: IT 359 - Spring 2026
-    
-    
+#>
+param(
+    [switch]$Verbose,
+    [switch]$DemoMode,
+    [switch]$LiveMode,
+    [switch]$Undo,
+    [string]$C2Server = '10.0.0.249',
+    [int]$C2Port = 8080
+)
+
+# Set defaults for switches when they were not explicitly provided
+if (-not $PSBoundParameters.ContainsKey('DemoMode')) { $DemoMode = $true }
+if (-not $PSBoundParameters.ContainsKey('Verbose'))  { $Verbose = $false }
+if (-not $PSBoundParameters.ContainsKey('LiveMode'))  { $LiveMode = $false }
+if (-not $PSBoundParameters.ContainsKey('Undo'))      { $Undo = $false }
+
+# Global State
+$Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
+$Global:C2Url = "http://${C2Server}:${C2Port}"
+
+# Normalize and assign mode switches (ensure booleans)
+$DemoMode = [bool]$DemoMode
+$LiveMode = [bool]$LiveMode
+$Undo = [bool]$Undo
+$Global:DemoMode = $DemoMode
+$Global:LiveMode = $LiveMode
+$Global:Undo = $Undo
+
 # Check for required cmdlets (these are built-in to PowerShell)
 $missing = @()
 if (-not (Get-Command -Name Invoke-RestMethod -ErrorAction SilentlyContinue)) {
