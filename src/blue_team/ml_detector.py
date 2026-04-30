@@ -48,6 +48,10 @@ def identify_suspicious_processes(processes: list) -> list:
 def main():
     try:
         while True:
+            user_input = input("Enter 'q' to quit: ")
+            if user_input == "q":
+                break
+
             # Example process features
             process_features = {
                 "pid": 1234,
