@@ -41,12 +41,13 @@ def identify_suspicious_processes(processes: list) -> list:
 
 def main():
     try:
+        print("Initializing AI model...")
         response = client.models.generate_content(
             model="gemini-3-flash-preview", 
-            contents="Explain how AI works in a few words",
-            stream=False
+            contents="Explain how AI works in a few words"
         )
-        print(response.text)
+        print(f"Response object: {response}")
+        print(f"Response text: {response.text}")
         print("The response has been generated. Now beginning classification...")
         while True:
             user_input = input("Enter 'q' to quit: ")
@@ -58,8 +59,8 @@ def main():
                 "pid": 1234,
                 "name": "powershell.exe",
                 "cmdline": "-nop -w hidden -enc ...",
-            "user": "user1",
-            "host": "localhost"
+                "user": "user1",
+                "host": "localhost"
             }
 
             result = classify_process_behavior(process_features)
@@ -77,11 +78,13 @@ def main():
                 # Log the action taken
                 print(f"Terminated suspicious process: {proc}")
 
-            # Log the action taken
-            with open("suspicious_processes.log", "a") as log_file:
-                log_file.write(f"Terminated suspicious process: {proc}\n")
+                # Log the action taken
+                with open("suspicious_processes.log", "a") as log_file:
+                    log_file.write(f"Terminated suspicious process: {proc}\n")
     except Exception as e:
+        import traceback
         print(f"Error occurred: {e}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":
