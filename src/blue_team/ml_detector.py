@@ -46,33 +46,38 @@ def identify_suspicious_processes(processes: list) -> list:
     return suspicious_processes
 
 def main():
-    # Example process features
-    process_features = {
-        "pid": 1234,
-        "name": "powershell.exe",
-        "cmdline": "-nop -w hidden -enc ...",
-        "user": "user1",
-        "host": "localhost"
-    }
+    try:
+        while True:
+            # Example process features
+            process_features = {
+                "pid": 1234,
+                "name": "powershell.exe",
+                "cmdline": "-nop -w hidden -enc ...",
+            "user": "user1",
+            "host": "localhost"
+            }
 
-    result = classify_process_behavior(process_features)
-    print(f"Process classification result: {result}")
+            result = classify_process_behavior(process_features)
+            print(f"Process classification result: {result}")
 
-    suspicious_processes = identify_suspicious_processes([process_features])
-    print(f"Suspicious processes found: {suspicious_processes}")
+            suspicious_processes = identify_suspicious_processes([process_features])
+            print(f"Suspicious processes found: {suspicious_processes}")
 
-    # Take action on suspicious processes (e.g., alert, terminate, etc.)
-    for proc in suspicious_processes:
-        print(f"Taking action on suspicious process: {proc}")
-        # Example action: terminate the process
-        # terminate_process(proc["pid"])
+            # Take action on suspicious processes (e.g., alert, terminate, etc.)
+            for proc in suspicious_processes:
+                print(f"Taking action on suspicious process: {proc}")
+                # Example action: terminate the process
+                # terminate_process(proc["pid"])
 
-        # Log the action taken
-        print(f"Terminated suspicious process: {proc}")
+                # Log the action taken
+                print(f"Terminated suspicious process: {proc}")
 
-    # Log the action taken
-    with open("suspicious_processes.log", "a") as log_file:
-        log_file.write(f"Terminated suspicious process: {proc}\n")
+            # Log the action taken
+            with open("suspicious_processes.log", "a") as log_file:
+                log_file.write(f"Terminated suspicious process: {proc}\n")
+    except Exception as e:
+        print(f"Error occurred: {e}")
+
 
     if __name__ == "__main__":
         main()
