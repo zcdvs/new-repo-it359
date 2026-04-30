@@ -13,6 +13,7 @@ WARNING: This is for educational purposes only.
 Only use in controlled lab environments.
 """
 
+from urllib import response
 from google import genai
 
 # The client gets the API key from the environment variable `GEMINI_API_KEY`.
@@ -43,11 +44,10 @@ def main():
     try:
         print("Initializing AI model...")
         response = client.models.generate_content(
-            model="gemini-3-flash-preview", 
-            contents="Explain how AI works in a few words"
+            model="gemini-3-flash-preview", contents="Explain how AI works in a few words"
         )
-        print(f"Response object: {response}")
         print(f"Response text: {response.text}")
+        print("----------------------------------------------------------------")
         print("The response has been generated. Now beginning classification...")
         while True:
             user_input = input("Enter 'q' to quit: ")
