@@ -18,12 +18,6 @@ from google import genai
 # The client gets the API key from the environment variable `GEMINI_API_KEY`.
 client = genai.Client()
 
-response = client.models.generate_content(
-    model="gemini-3-flash-preview", contents="Explain how AI works in a few words"
-)
-print(response.text)
-
-
 def classify_process_behavior(features: dict) -> str:
     response = client.models.generate_content(
         model="gemini-3-flash-preview", contents=str(features)
@@ -47,6 +41,11 @@ def identify_suspicious_processes(processes: list) -> list:
 
 def main():
     try:
+        response = client.models.generate_content(
+            model="gemini-3-flash-preview", contents="Explain how AI works in a few words"
+        )
+        print(response.text)
+        print("The response has been generated. Now beginning classification...")
         while True:
             user_input = input("Enter 'q' to quit: ")
             if user_input == "q":
@@ -83,5 +82,5 @@ def main():
         print(f"Error occurred: {e}")
 
 
-    if __name__ == "__main__":
-        main()
+if __name__ == "__main__":
+    main()
