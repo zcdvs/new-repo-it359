@@ -85,7 +85,7 @@ def looks_suspicious(proc: Dict[str, Any]) -> bool:
 
 def classify_process_behavior(features: dict) -> str:
     response = client.models.generate_content(
-        model="gemini-3-flash-preview", contents=str(features)
+        model="gemma-4-31b-it", contents=str(features)
     )
     return response.text
 
