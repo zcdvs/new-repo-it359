@@ -847,7 +847,7 @@ try {
             if ($registered) {
                 # Basic immediate test: spawn calc and see if the payload creates the desktop file
                 Write-Host "    [*] Running quick test trigger (starting calc.exe)..." -ForegroundColor Gray
-                Start-Process calc.exe -NoNewWindow
+                # Start-Process calc.exe -NoNewWindow
                 Start-Sleep -Seconds 3
                 if (Test-Path (Join-Path $dp 'calcLOG.txt')) {
                     Write-Host "    [OK] Session-based WMI action executed: calcLOG.txt created." -ForegroundColor Green
