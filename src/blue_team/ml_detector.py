@@ -315,6 +315,12 @@ def main():
     while True:
         snapshot = iter_processes()
 
+        # Per-cycle counters (for a concise "is it working?" summary)
+        scanned_count = 0
+        nonzero_score_count = 0
+        escalated_to_ai_count = 0
+        powershell_seen_count = 0
+
         # Choose candidates depending on scan mode.
         # - new: only look at newly observed PIDs
         # - all: look at all running processes each poll (throttled)
@@ -329,8 +335,9 @@ def main():
             for p in procs:
                 known_pids.add(p["pid"])
 
-        # Step 1: cap throughput (cost control)
+        # Step 1: iterate candidates
         for proc in procs:
+            scanned_count += 1
             features = {
                 "pid": proc.get("pid"),
                 "name": proc.get("name"),
@@ -345,28 +352,42 @@ def main():
             features["local_score"] = score
             features["local_reasons"] = reasons
 
+            if score > 0:
+                nonzero_score_count += 1
+
             # LiveMode behavior signal: PowerShell process making outbound connections.
             pid_val = features.get("pid")
-            conn_count, remotes = count_remote_connections(pid_val)
+            conn_count = 0
+            remotes: List[str] = []
+            if isinstance(pid_val, int) and pid_val > 0:
+                conn_count, remotes = count_remote_connections(pid_val)
+                if conn_count > 0:
+                    # Weight network activity fairly high.
+                    score += 4
+                    reasons.append("outbound network connections")
+                    features["local_score"] = score
+                    features["local_reasons"] = reasons
+
             features["remote_connection_count"] = conn_count
             features["remote_endpoints"] = remotes
-            if conn_count > 0:
-                # Weight network activity for PowerShell fairly high.
-                score += 4
-                reasons.append("outbound network connections")
-                features["local_score"] = score
-                features["local_reasons"] = reasons
 
             # Optional: add a low-cost "suspicious cmdline" hint.
             # If this is false and the score is low, it's likely benign.
             features["cmdline_high_signal"] = looks_suspicious(proc)
 
+            is_ps = is_powershell_family(proc)
+            if is_ps:
+                powershell_seen_count += 1
+
             if show_scores:
-                print(
-                    f"[monitor] pid={features.get('pid')} name={features.get('name')} "
-                    f"score={features.get('local_score')} reasons={features.get('local_reasons')} "
-                    f"remotes={features.get('remote_connection_count', 0)}"
-                )
+                # Reduce noise: only print per-process lines when there's any local signal.
+                # Also print PowerShell-family processes so demos are easier to follow.
+                if score > 0 or is_ps:
+                    print(
+                        f"[monitor] pid={features.get('pid')} name={features.get('name')} "
+                        f"score={features.get('local_score')} reasons={features.get('local_reasons')} "
+                        f"remotes={features.get('remote_connection_count', 0)}"
+                    )
 
             pid = features.get("pid")
             create_time = features.get("create_time")
@@ -400,6 +421,7 @@ def main():
                     )
                 continue
 
+            escalated_to_ai_count += 1
             prompt = build_model_prompt(features, score, reasons)
             result = classify_process_behavior(prompt)
             parsed = parse_model_json(result)
@@ -435,6 +457,14 @@ def main():
                         )
                         + "\n"
                     )
+
+        # Concise cycle summary so users can tell the tool is alive even when nothing is suspicious.
+        # Only emit when per-process printing didn't produce much signal.
+        if show_scores and (nonzero_score_count == 0 and escalated_to_ai_count == 0):
+            print(
+                f"[cycle] scanned={scanned_count} nonzero_scores={nonzero_score_count} "
+                f"powershell_seen={powershell_seen_count} escalated_to_ai={escalated_to_ai_count} (no alerts)"
+            )
 
         time.sleep(poll_seconds)
 
