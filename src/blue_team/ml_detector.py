@@ -173,6 +173,34 @@ def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
     return score, reasons
 
 
+def count_remote_connections(pid: int) -> Tuple[int, List[str]]:
+    """Return (count, remote_endpoints) for established/outbound connections.
+
+    This is a portable-ish behavior signal for LiveMode beaconing.
+    It won't catch everything, but it's often enough to detect HTTP beacons.
+    """
+
+    remotes: List[str] = []
+    try:
+        p = psutil.Process(pid)
+        for c in p.net_connections(kind="inet"):
+            if not c.raddr:
+                continue
+            # On Windows/macOS/Linux: raddr is typically an (ip, port) tuple
+            ip = getattr(c.raddr, "ip", None) or (c.raddr[0] if isinstance(c.raddr, tuple) else None)
+            port = getattr(c.raddr, "port", None) or (c.raddr[1] if isinstance(c.raddr, tuple) else None)
+            state = (c.status or "").upper()
+            if state in {"ESTABLISHED", "SYN_SENT"}:
+                remotes.append(f"{ip}:{port}")
+    except Exception:
+        # AccessDenied is common without admin; treat as unknown rather than failing.
+        return 0, []
+
+    # Return unique endpoints but keep a stable list for logging.
+    remotes_unique = sorted(set([r for r in remotes if r and "None" not in r]))
+    return len(remotes_unique), remotes_unique
+
+
 def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str]) -> str:
     """Build an instruction prompt that requests strict JSON from the model.
 
@@ -236,14 +264,13 @@ def classify_process_behavior(prompt: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
-    try:
-        print("Initializing AI model...")
-        response = client.models.generate_content(
-            model="gemini-3-flash-preview", contents="Explain how AI works in a few words"
-        )
-        print(f"Response text: {response.text}")
-        print("----------------------------------------------------------------")
-        print("Monitoring running processes. Press Ctrl+C to stop.")
+    print("Initializing AI model...")
+    response = client.models.generate_content(
+        model="gemini-3-flash-preview", contents="Explain how AI works in a few words"
+    )
+    print(f"Response text: {response.text}")
+    print("----------------------------------------------------------------")
+    print("Monitoring running processes. Press Ctrl+C to stop.")
 
         # Tuning knobs (environment variables)
         # - ML_DETECTOR_POLL_SECONDS: polling interval
@@ -253,133 +280,163 @@ def main():
         #       new: only processes first observed after the detector starts
         #       all: re-check running processes each poll (with throttle)
         # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
-        poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "2"))
-        max_per_cycle = int(os.getenv("ML_DETECTOR_MAX_PER_CYCLE", "3"))
-        min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "5"))
-        scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "new").strip().lower()
-        debug = get_env_bool("ML_DETECTOR_DEBUG", False)
+    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "2"))
+    max_per_cycle = int(os.getenv("ML_DETECTOR_MAX_PER_CYCLE", "3"))
+    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "5"))
 
-        # In "all" mode, avoid hammering the same long-running process.
-        # Re-check a (pid, cmdline) at most every N seconds.
-        throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
-        last_checked: Dict[Tuple[int, int], float] = {}
+    # For LiveMode beaconing, "all" is usually the right default because
+    # the PowerShell host process may already exist before the detector starts.
+    scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "all").strip().lower()
+    debug = get_env_bool("ML_DETECTOR_DEBUG", False)
+    show_scores = get_env_bool("ML_DETECTOR_SHOW_SCORES", True)
 
-        # Dedupe:
-        #   Track which process instances have already been escalated to the AI.
-        #   This prevents repeated queries for the same long-running process.
-        seen_keys: set[Tuple[int, Optional[float], int]] = set()
+    # In "all" mode, avoid hammering the same long-running process.
+    # Re-check a (pid, cmdline) at most every N seconds.
+    throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
+    last_checked: Dict[Tuple[int, int], float] = {}
 
-        # Tracking set used to detect *new* processes between polls.
-        known_pids: set[int] = set()
+    # Dedupe:
+    #   Track which process instances have already been escalated to the AI.
+    #   This prevents repeated queries for the same long-running process.
+    seen_keys: set[Tuple[int, Optional[float], int]] = set()
 
-        while True:
-            snapshot = iter_processes()
+    # Tracking set used to detect *new* processes between polls.
+    known_pids: set[int] = set()
 
-            # Choose candidates depending on scan mode.
-            # - new: only look at newly observed PIDs
-            # - all: look at all running processes each poll (throttled)
-            if scan_mode == "all":
-                procs = [p for p in snapshot if isinstance(p.get("pid"), int)]
-            else:
-                procs = [p for p in snapshot if isinstance(p.get("pid"), int) and p["pid"] not in known_pids]
-                for p in procs:
-                    known_pids.add(p["pid"])
+    while True:
+        snapshot = iter_processes()
 
-            # Step 1: low-cost pre-filter (avoid AI on everything)
-            # In a "real-time monitor" scenario, we still want observability.
-            # So we treat PowerShell-family processes as *monitorable* and then
-            # rely on scoring/threshold before AI escalation.
-            candidates = [p for p in procs if is_powershell_family(p)]
-            if not candidates:
-                time.sleep(poll_seconds)
+        # Choose candidates depending on scan mode.
+        # - new: only look at newly observed PIDs
+        # - all: look at all running processes each poll (throttled)
+        if scan_mode == "all":
+            procs = [p for p in snapshot if isinstance(p.get("pid"), int)]
+        else:
+            procs = [
+                p
+                for p in snapshot
+                if isinstance(p.get("pid"), int) and p["pid"] not in known_pids
+            ]
+            for p in procs:
+                known_pids.add(p["pid"])
+
+        # Step 1: low-cost pre-filter (avoid AI on everything)
+        # In a "real-time monitor" scenario, we still want observability.
+        # So we treat PowerShell-family processes as *monitorable* and then
+        # rely on scoring/threshold before AI escalation.
+        candidates = [p for p in procs if is_powershell_family(p)]
+        if not candidates:
+            time.sleep(poll_seconds)
+            continue
+
+        # Step 2: cap throughput (cost control)
+        to_check = candidates[:max_per_cycle]
+        for proc in to_check:
+            features = {
+                "pid": proc.get("pid"),
+                "name": proc.get("name"),
+                "cmdline": proc.get("cmdline"),
+                "user": proc.get("user"),
+                "host": proc.get("host"),
+                "create_time": proc.get("create_time"),
+            }
+
+            # Step 3: local scoring (avoid AI unless there's enough signal)
+            score, reasons = local_risk_score(proc)
+            features["local_score"] = score
+            features["local_reasons"] = reasons
+
+            # LiveMode behavior signal: PowerShell process making outbound connections.
+            pid_val = features.get("pid")
+            if isinstance(pid_val, int) and pid_val > 0:
+                conn_count, remotes = count_remote_connections(pid_val)
+                features["remote_connection_count"] = conn_count
+                features["remote_endpoints"] = remotes
+                if conn_count > 0:
+                    # Weight network activity for PowerShell fairly high.
+                    score += 4
+                    reasons.append("outbound network connections")
+                    features["local_score"] = score
+                    features["local_reasons"] = reasons
+
+            # Optional: add a low-cost "suspicious cmdline" hint.
+            # If this is false and the score is low, it's likely benign.
+            features["cmdline_high_signal"] = looks_suspicious(proc)
+
+            if show_scores:
+                print(
+                    f"[monitor] pid={features.get('pid')} name={features.get('name')} "
+                    f"score={features.get('local_score')} reasons={features.get('local_reasons')} "
+                    f"remotes={features.get('remote_connection_count', 0)}"
+                )
+
+            pid = features.get("pid")
+            create_time = features.get("create_time")
+            cmd_hash = hash(features.get("cmdline") or "")
+            proc_key = (
+                int(pid) if isinstance(pid, int) else -1,
+                float(create_time) if isinstance(create_time, (int, float)) else None,
+                cmd_hash,
+            )
+            # Step 4: dedupe AI calls per process instance
+            if proc_key in seen_keys:
+                continue
+            seen_keys.add(proc_key)
+
+            # Additional throttle for scan_mode=all
+            pid_i = int(pid) if isinstance(pid, int) else -1
+            cmd_hash2 = hash(features.get("cmdline") or "")
+            throttle_key = (pid_i, cmd_hash2)
+            now = time.time()
+            last = last_checked.get(throttle_key)
+            if scan_mode == "all" and last is not None and (now - last) < throttle_seconds:
+                if debug:
+                    print(
+                        f"[debug] throttled pid={pid_i} ({int(now - last)}s since last check)"
+                    )
+                continue
+            last_checked[throttle_key] = now
+
+            # Step 5: AI escalation threshold
+            if score < min_score_for_ai:
+                if debug:
+                    print(
+                        f"[debug] skip-ai pid={features.get('pid')} name={features.get('name')} "
+                        f"score={score} reasons={reasons} cmdline_high_signal={features.get('cmdline_high_signal')}"
+                    )
                 continue
 
-            # Step 2: cap throughput (cost control)
-            to_check = candidates[:max_per_cycle]
-            for proc in to_check:
-                features = {
-                    "pid": proc.get("pid"),
-                    "name": proc.get("name"),
-                    "cmdline": proc.get("cmdline"),
-                    "user": proc.get("user"),
-                    "host": proc.get("host"),
-                    "create_time": proc.get("create_time"),
-                }
+            prompt = build_model_prompt(features, score, reasons)
+            result = classify_process_behavior(prompt)
+            parsed = parse_model_json(result)
 
-                # Step 3: local scoring (avoid AI unless there's enough signal)
-                score, reasons = local_risk_score(proc)
-                features["local_score"] = score
-                features["local_reasons"] = reasons
+            # Step 6: output + optional logging of suspicious/malicious verdicts
+            print("\n[AI] Process classification:")
+            print(json.dumps(features, indent=2))
+            print(result)
 
-                # Optional: add a low-cost "suspicious cmdline" hint.
-                # If this is false and the score is low, it's likely benign.
-                features["cmdline_high_signal"] = looks_suspicious(proc)
+            verdict = None
+            confidence = None
+            if parsed:
+                verdict = (parsed.get("verdict") or "").lower()
+                confidence = parsed.get("confidence")
 
-                pid = features.get("pid")
-                create_time = features.get("create_time")
-                cmd_hash = hash(features.get("cmdline") or "")
-                proc_key = (int(pid) if isinstance(pid, int) else -1, float(create_time) if isinstance(create_time, (int, float)) else None, cmd_hash)
-                # Step 4: dedupe AI calls per process instance
-                if proc_key in seen_keys:
-                    continue
-                seen_keys.add(proc_key)
-
-                # Additional throttle for scan_mode=all
-                pid_i = int(pid) if isinstance(pid, int) else -1
-                cmd_hash2 = hash(features.get("cmdline") or "")
-                throttle_key = (pid_i, cmd_hash2)
-                now = time.time()
-                last = last_checked.get(throttle_key)
-                if scan_mode == "all" and last is not None and (now - last) < throttle_seconds:
-                    if debug:
-                        print(f"[debug] throttled pid={pid_i} ({int(now - last)}s since last check)")
-                    continue
-                last_checked[throttle_key] = now
-
-                # Step 5: AI escalation threshold
-                if score < min_score_for_ai:
-                    if debug:
-                        print(
-                            f"[debug] skip-ai pid={features.get('pid')} name={features.get('name')} "
-                            f"score={score} reasons={reasons} cmdline_high_signal={features.get('cmdline_high_signal')}"
+            if verdict in {"suspicious", "malicious"}:
+                with open("suspicious_processes.log", "a", encoding="utf-8") as log_file:
+                    log_file.write(
+                        json.dumps(
+                            {
+                                "features": features,
+                                "verdict": verdict,
+                                "confidence": confidence,
+                                "model_output": parsed or result,
+                            },
+                            ensure_ascii=False,
                         )
-                    continue
+                        + "\n"
+                    )
 
-                prompt = build_model_prompt(features, score, reasons)
-                result = classify_process_behavior(prompt)
-                parsed = parse_model_json(result)
-
-                # Step 6: output + optional logging of suspicious/malicious verdicts
-                print("\n[AI] Process classification:")
-                print(json.dumps(features, indent=2))
-                print(result)
-
-                verdict = None
-                confidence = None
-                if parsed:
-                    verdict = (parsed.get("verdict") or "").lower()
-                    confidence = parsed.get("confidence")
-
-                if verdict in {"suspicious", "malicious"}:
-                    with open("suspicious_processes.log", "a", encoding="utf-8") as log_file:
-                        log_file.write(
-                            json.dumps(
-                                {
-                                    "features": features,
-                                    "verdict": verdict,
-                                    "confidence": confidence,
-                                    "model_output": parsed or result,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
-
-            time.sleep(poll_seconds)
-    except Exception as e:
-        import traceback
-        print(f"Error occurred: {e}")
-        traceback.print_exc()
+        time.sleep(poll_seconds)
 
 
 if __name__ == "__main__":
