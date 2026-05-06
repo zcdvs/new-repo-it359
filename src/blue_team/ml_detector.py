@@ -112,7 +112,7 @@ def looks_suspicious(proc: Dict[str, Any]) -> bool:
         "new-object net.webclient",
     ]
 
-    return any(k in cmd for k in high_signal)
+    return any(k in cmd for k in map(str.lower, high_signal))
 
 
 def is_powershell_family(proc: Dict[str, Any]) -> bool:
@@ -158,6 +158,14 @@ def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
         (r"invoke-expression|\biex\b", 3, "Invoke-Expression"),
         (r"downloadstring|downloaddata|new-object\s+net\.webclient", 4, "download cradle"),
         (r"invoke-webrequest|invoke-restmethod", 2, "HTTP client"),
+        (r"frombase64string", 4, "base64 decode"),
+        (r"(?<![a-zA-Z0-9])base64(?![a-zA-Z0-9])", 4, "base64 decode"),
+        (r"(?<![a-zA-Z0-9])b64(?![a-zA-Z0-9])", 4, "base64 decode"),
+        (r"(?<![a-zA-Z0-9])data:(?![a-zA-Z0-9])", 4, "data URI"),
+        (r"(?<![a-zA-Z0-9])blob:(?![a-zA-Z0-9])", 4, "blob URI"),
+        (r"(?<![a-zA-Z0-9])file:(?![a-zA-Z0-9])", 4, "file URI"),
+        (r"(?<![a-zA-Z0-9])http(?![a-zA-Z0-9])", 2, "HTTP in cmdline"),
+        (r"(?<![a-zA-Z0-9])Invoke-WebRequest(?![a-zA-Z0-9])", 3, "Invoke-WebRequest")
     ]
 
     for pattern, pts, label in indicators:
@@ -210,8 +218,15 @@ def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str])
     """
     return (
         "You are a blue-team process-behavior classifier. "
-        "Given process features, return STRICT JSON ONLY (no markdown) with keys: "
-        "verdict (one of benign|suspicious|malicious), confidence (0-10), reasons (array of strings).\n"
+        "Return STRICT JSON ONLY (no markdown, no prose, no code fences). "
+        "The JSON object MUST have exactly these keys: "
+        "verdict, confidence, reasons, process_id_explanation. "
+        "\n"
+        "- verdict: one of 'benign' | 'suspicious' | 'malicious'\n"
+        "- confidence: integer 0-10\n"
+        "- reasons: array of short strings explaining the verdict\n"
+        "- process_id_explanation: a 1-3 sentence plain-English explanation of what the process ID (pid) represents for *this* process on the host, and why it helps investigation\n"
+        "\n"
         f"LocalHeuristicScore: {score}\n"
         f"LocalHeuristicReasons: {reasons}\n"
         f"ProcessFeatures: {json.dumps(features, ensure_ascii=False)}\n"
@@ -266,7 +281,7 @@ def classify_process_behavior(prompt: str) -> str:
 def main():
     print("Initializing AI model...")
     response = client.models.generate_content(
-        model="gemini-3-flash-preview", contents="Explain how AI works in a few words"
+        model="gemini-3-flash-preview", contents="Explain how AI works in a few words in simple terms, specifically focusing on cybersecurity."
     )
     print(f"Response text: {response.text}")
     print("----------------------------------------------------------------")
@@ -282,7 +297,7 @@ def main():
         # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
     poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "2"))
     max_per_cycle = int(os.getenv("ML_DETECTOR_MAX_PER_CYCLE", "3"))
-    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "5"))
+    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "3"))
 
     # For LiveMode beaconing, "all" is usually the right default because
     # the PowerShell host process may already exist before the detector starts.
@@ -320,17 +335,8 @@ def main():
             for p in procs:
                 known_pids.add(p["pid"])
 
-        # Step 1: low-cost pre-filter (avoid AI on everything)
-        # In a "real-time monitor" scenario, we still want observability.
-        # So we treat PowerShell-family processes as *monitorable* and then
-        # rely on scoring/threshold before AI escalation.
-        candidates = [p for p in procs if is_powershell_family(p)]
-        if not candidates:
-            time.sleep(poll_seconds)
-            continue
-
-        # Step 2: cap throughput (cost control)
-        to_check = candidates[:max_per_cycle]
+        # Step 1: cap throughput (cost control)
+        to_check = procs[:max_per_cycle]
         for proc in to_check:
             features = {
                 "pid": proc.get("pid"),
@@ -341,7 +347,7 @@ def main():
                 "create_time": proc.get("create_time"),
             }
 
-            # Step 3: local scoring (avoid AI unless there's enough signal)
+            # Step 2: local scoring (avoid AI unless there's enough signal)
             score, reasons = local_risk_score(proc)
             features["local_score"] = score
             features["local_reasons"] = reasons
@@ -378,7 +384,7 @@ def main():
                 float(create_time) if isinstance(create_time, (int, float)) else None,
                 cmd_hash,
             )
-            # Step 4: dedupe AI calls per process instance
+            # Step 3: dedupe AI calls per process instance
             if proc_key in seen_keys:
                 continue
             seen_keys.add(proc_key)
@@ -397,7 +403,7 @@ def main():
                 continue
             last_checked[throttle_key] = now
 
-            # Step 5: AI escalation threshold
+            # Step 4: AI escalation threshold
             if score < min_score_for_ai:
                 if debug:
                     print(
@@ -410,16 +416,21 @@ def main():
             result = classify_process_behavior(prompt)
             parsed = parse_model_json(result)
 
-            # Step 6: output + optional logging of suspicious/malicious verdicts
+            # Step 5: output + optional logging of suspicious/malicious verdicts
             print("\n[AI] Process classification:")
             print(json.dumps(features, indent=2))
             print(result)
 
             verdict = None
             confidence = None
+            pid_explanation = None
             if parsed:
                 verdict = (parsed.get("verdict") or "").lower()
                 confidence = parsed.get("confidence")
+                pid_explanation = parsed.get("process_id_explanation")
+
+            if pid_explanation:
+                print(f"[AI] PID explanation: {pid_explanation}")
 
             if verdict in {"suspicious", "malicious"}:
                 with open("suspicious_processes.log", "a", encoding="utf-8") as log_file:
@@ -429,6 +440,7 @@ def main():
                                 "features": features,
                                 "verdict": verdict,
                                 "confidence": confidence,
+                                "process_id_explanation": pid_explanation,
                                 "model_output": parsed or result,
                             },
                             ensure_ascii=False,
