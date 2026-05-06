@@ -21,13 +21,154 @@ import re
 import socket
 import time
 from collections import deque
+from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from typing import Any, Deque, Dict, List, Optional, Tuple
+import logging
+import platform
 
 import psutil
 from google import genai
 
 # The client gets the API key from the environment variable `GEMINI_API_KEY`.
 client = genai.Client()
+
+
+@dataclass(frozen=True)
+class DetectorConfig:
+    poll_seconds: float
+    scan_mode: str
+    debug: bool
+    output_mode: str
+    cycle_summary_every: int
+    alert_score_threshold: int
+    min_score_for_ai: int
+    max_ai_per_cycle: int
+    throttle_seconds: float
+    net_boost_powershell_only: bool
+    write_alert_log: bool
+    alert_log_path: str
+    ai_verbose: bool
+    ai_print_pid_expl: bool
+    monitor_print_cmdline: bool
+    allow_process_names: List[str]
+    allow_cmdline_regex: List[re.Pattern[str]]
+    deny_process_names: List[str]
+    deny_cmdline_regex: List[re.Pattern[str]]
+    json_log_path: str
+
+
+def _split_csv(raw: str) -> List[str]:
+    return [x.strip() for x in (raw or "").split(",") if x.strip()]
+
+
+def _compile_regex_list(raw: str) -> List[re.Pattern[str]]:
+    out: List[re.Pattern[str]] = []
+    for pat in _split_csv(raw):
+        try:
+            out.append(re.compile(pat, re.IGNORECASE))
+        except re.error:
+            # Ignore invalid patterns rather than crashing in production.
+            continue
+    return out
+
+
+def get_config() -> DetectorConfig:
+    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "5"))
+    scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "all").strip().lower()
+    debug = get_env_bool("ML_DETECTOR_DEBUG", False)
+
+    output_mode = os.getenv("ML_DETECTOR_OUTPUT_MODE", "quiet").strip().lower()
+    cycle_summary_every = int(os.getenv("ML_DETECTOR_CYCLE_SUMMARY_EVERY", "6"))
+    alert_score_threshold = int(os.getenv("ML_DETECTOR_ALERT_SCORE_THRESHOLD", "4"))
+    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "2"))
+    max_ai_per_cycle = int(os.getenv("ML_DETECTOR_MAX_AI_PER_CYCLE", "3"))
+
+    throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
+    net_boost_powershell_only = get_env_bool("ML_DETECTOR_NET_BOOST_POWERSHELL_ONLY", True)
+
+    ai_verbose = get_env_bool("ML_DETECTOR_AI_VERBOSE", False)
+    ai_print_pid_expl = get_env_bool("ML_DETECTOR_AI_PRINT_PID_EXPLANATION", False)
+    monitor_print_cmdline = get_env_bool("ML_DETECTOR_MONITOR_PRINT_CMDLINE", False)
+    write_alert_log = get_env_bool("ML_DETECTOR_WRITE_ALERT_LOG", False)
+    alert_log_path = os.getenv("ML_DETECTOR_ALERT_LOG_PATH", "suspicious_processes.log")
+
+    allow_process_names = [x.lower() for x in _split_csv(os.getenv("ML_DETECTOR_ALLOW_PROCESS_NAMES", ""))]
+    deny_process_names = [x.lower() for x in _split_csv(os.getenv("ML_DETECTOR_DENY_PROCESS_NAMES", ""))]
+    allow_cmdline_regex = _compile_regex_list(os.getenv("ML_DETECTOR_ALLOW_CMDLINE_REGEX", ""))
+    deny_cmdline_regex = _compile_regex_list(os.getenv("ML_DETECTOR_DENY_CMDLINE_REGEX", ""))
+
+    json_log_path = os.getenv("ML_DETECTOR_JSON_LOG_PATH", "ml_detector.jsonl")
+
+    return DetectorConfig(
+        poll_seconds=poll_seconds,
+        scan_mode=scan_mode,
+        debug=debug,
+        output_mode=output_mode,
+        cycle_summary_every=cycle_summary_every,
+        alert_score_threshold=alert_score_threshold,
+        min_score_for_ai=min_score_for_ai,
+        max_ai_per_cycle=max_ai_per_cycle,
+        throttle_seconds=throttle_seconds,
+        net_boost_powershell_only=net_boost_powershell_only,
+        write_alert_log=write_alert_log,
+        alert_log_path=alert_log_path,
+        ai_verbose=ai_verbose,
+        ai_print_pid_expl=ai_print_pid_expl,
+        monitor_print_cmdline=monitor_print_cmdline,
+        allow_process_names=allow_process_names,
+        allow_cmdline_regex=allow_cmdline_regex,
+        deny_process_names=deny_process_names,
+        deny_cmdline_regex=deny_cmdline_regex,
+        json_log_path=json_log_path,
+    )
+
+
+def setup_logger(cfg: DetectorConfig) -> logging.Logger:
+    logger = logging.getLogger("ml_detector")
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.DEBUG if cfg.debug else logging.INFO)
+
+    # JSONL log suitable for ingestion (Splunk/ELK/etc.)
+    handler = RotatingFileHandler(
+        cfg.json_log_path,
+        maxBytes=int(os.getenv("ML_DETECTOR_JSON_LOG_MAX_BYTES", str(2 * 1024 * 1024))),
+        backupCount=int(os.getenv("ML_DETECTOR_JSON_LOG_BACKUPS", "3")),
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.DEBUG if cfg.debug else logging.INFO)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    logger.addHandler(handler)
+    return logger
+
+
+def log_event(logger: logging.Logger, event: Dict[str, Any]) -> None:
+    try:
+        logger.info(json.dumps(event, ensure_ascii=False))
+    except Exception:
+        # Never crash the detector due to logging.
+        pass
+
+
+def is_allowed_by_policy(proc: Dict[str, Any], cfg: DetectorConfig) -> bool:
+    name = (proc.get("name") or "").lower()
+    cmd = (proc.get("cmdline") or "")
+
+    if cfg.deny_process_names and name in cfg.deny_process_names:
+        return False
+    if any(p.search(cmd) for p in cfg.deny_cmdline_regex):
+        return False
+
+    # If allowlists are provided, require a match.
+    if cfg.allow_process_names or cfg.allow_cmdline_regex:
+        if name in cfg.allow_process_names:
+            return True
+        if any(p.search(cmd) for p in cfg.allow_cmdline_regex):
+            return True
+        return False
+
+    return True
 
 
 def trunc(s: str, max_len: int = 160) -> str:
@@ -382,17 +523,20 @@ def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str])
     - It reduces the need for brittle substring matching (e.g., "malicious").
     - It makes logging and downstream automation easier.
     """
+    # Production note: keep this prompt stable and explicit.
+    # We want deterministic keys and minimal risk of the model returning prose.
     return (
-        "You are a blue-team process-behavior classifier. "
-    "You may use timing/periodicity features (beacon_likeness) to detect C2-style beaconing. "
+        "You are a blue-team process-behavior classifier for endpoint telemetry. "
+        "Classify the process as benign/suspicious/malicious using the provided features. "
+        "You may use timing/periodicity features (beacon_likeness) to reason about C2-style beaconing, "
+        "but do not over-weight networking alone. "
         "Return STRICT JSON ONLY (no markdown, no prose, no code fences). "
-        "The JSON object MUST have exactly these keys: "
-        "verdict, confidence, reasons, process_id_explanation. "
+        "The JSON object MUST have exactly these keys: verdict, confidence, reasons, process_id_explanation. "
         "\n"
         "- verdict: one of 'benign' | 'suspicious' | 'malicious'\n"
         "- confidence: integer 0-10\n"
         "- reasons: array of short strings explaining the verdict\n"
-        "- process_id_explanation: a 1-3 sentence plain-English explanation of what the process ID (pid) represents for *this* process on the host, and why it helps investigation\n"
+        "- process_id_explanation: 1-3 sentences explaining what PID represents on this host and how to pivot\n"
         "\n"
         f"LocalHeuristicScore: {score}\n"
         f"LocalHeuristicReasons: {reasons}\n"
@@ -460,6 +604,9 @@ def classify_process_behavior(prompt: str) -> str:
 # ---------------------------------------------------------------------------
 
 def main():
+    cfg = get_config()
+    logger = setup_logger(cfg)
+
     print("Initializing AI model...")
     try:
         response = client.models.generate_content(
@@ -475,6 +622,28 @@ def main():
     print("----------------------------------------------------------------")
     print("Monitoring running processes. Press Ctrl+C to stop.")
 
+    # Structured startup log for ops.
+    log_event(
+        logger,
+        {
+            "event": "startup",
+            "ts": time.time(),
+            "host": socket.gethostname(),
+            "platform": platform.platform(),
+            "python": platform.python_version(),
+            "config": {
+                "poll_seconds": cfg.poll_seconds,
+                "scan_mode": cfg.scan_mode,
+                "output_mode": cfg.output_mode,
+                "min_score_for_ai": cfg.min_score_for_ai,
+                "max_ai_per_cycle": cfg.max_ai_per_cycle,
+                "throttle_seconds": cfg.throttle_seconds,
+                "net_boost_powershell_only": cfg.net_boost_powershell_only,
+                "json_log_path": cfg.json_log_path,
+            },
+        },
+    )
+
     # Tuning knobs (environment variables)
     # - ML_DETECTOR_POLL_SECONDS: polling interval
     # - ML_DETECTOR_MIN_SCORE: minimum local heuristic score before AI
@@ -482,40 +651,36 @@ def main():
     #       new: only processes first observed after the detector starts
     #       all: re-check running processes each poll (with throttle)
     # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
-    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "5"))
-    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "2"))
-    max_ai_per_cycle = int(os.getenv("ML_DETECTOR_MAX_AI_PER_CYCLE", "3"))
+    poll_seconds = cfg.poll_seconds
+    min_score_for_ai = cfg.min_score_for_ai
+    max_ai_per_cycle = cfg.max_ai_per_cycle
 
     # For LiveMode beaconing, "all" is usually the right default because
     # the PowerShell host process may already exist before the detector starts.
-    scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "all").strip().lower()
-    debug = get_env_bool("ML_DETECTOR_DEBUG", False)
-    # Console output mode:
-    # - quiet (default): only prints AI alerts + periodic cycle summary
-    # - monitor: prints per-process monitor lines (noisy)
-    output_mode = os.getenv("ML_DETECTOR_OUTPUT_MODE", "quiet").strip().lower()
+    scan_mode = cfg.scan_mode
+    debug = cfg.debug
+    output_mode = cfg.output_mode
     show_scores = output_mode == "monitor"
-    # If you still want some basic liveness output in quiet mode.
-    cycle_summary_every = int(os.getenv("ML_DETECTOR_CYCLE_SUMMARY_EVERY", "6"))
-    alert_score_threshold = int(os.getenv("ML_DETECTOR_ALERT_SCORE_THRESHOLD", "4"))
+    cycle_summary_every = cfg.cycle_summary_every
+    alert_score_threshold = cfg.alert_score_threshold
 
     # Output controls:
     # - ML_DETECTOR_AI_VERBOSE=1 -> print full features + raw model output
     # - ML_DETECTOR_AI_PRINT_PID_EXPLANATION=1 -> print PID explanation line
     # - ML_DETECTOR_MONITOR_PRINT_CMDLINE=1 -> include cmdline (truncated) in monitor lines
-    ai_verbose = get_env_bool("ML_DETECTOR_AI_VERBOSE", False)
-    ai_print_pid_expl = get_env_bool("ML_DETECTOR_AI_PRINT_PID_EXPLANATION", False)
-    monitor_print_cmdline = get_env_bool("ML_DETECTOR_MONITOR_PRINT_CMDLINE", False)
-    write_alert_log = get_env_bool("ML_DETECTOR_WRITE_ALERT_LOG", False)
-    alert_log_path = os.getenv("ML_DETECTOR_ALERT_LOG_PATH", "suspicious_processes.log")
+    ai_verbose = cfg.ai_verbose
+    ai_print_pid_expl = cfg.ai_print_pid_expl
+    monitor_print_cmdline = cfg.monitor_print_cmdline
+    write_alert_log = cfg.write_alert_log
+    alert_log_path = cfg.alert_log_path
 
     # Reduce noise: by default only treat outbound network connections as a strong
     # signal for PowerShell-family processes (common for fileless toolchains).
-    net_boost_powershell_only = get_env_bool("ML_DETECTOR_NET_BOOST_POWERSHELL_ONLY", True)
+    net_boost_powershell_only = cfg.net_boost_powershell_only
 
     # In "all" mode, avoid hammering the same long-running process.
     # Re-check a (pid, cmdline) at most every N seconds.
-    throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
+    throttle_seconds = cfg.throttle_seconds
     last_checked: Dict[Tuple[int, int], float] = {}
 
     # Tracking set used to detect *new* processes between polls.
@@ -572,6 +737,14 @@ def main():
     # Step 1: iterate candidates
         for proc in procs:
             scanned_count += 1
+
+            if not is_allowed_by_policy(proc, cfg):
+                if debug:
+                    print(
+                        f"[debug] policy-skip pid={proc.get('pid')} name={proc.get('name')}"
+                    )
+                continue
+
             features = {
                 "pid": proc.get("pid"),
                 "name": proc.get("name"),
@@ -580,6 +753,10 @@ def main():
                 "host": proc.get("host"),
                 "create_time": proc.get("create_time"),
             }
+
+            # Always include stable environment fields for downstream correlation.
+            features["platform"] = platform.system().lower()
+            features["platform_release"] = platform.release()
 
             # Step 2: local scoring (avoid AI unless there's enough signal)
             score, reasons = local_risk_score(proc)
@@ -746,6 +923,24 @@ def main():
                     )
                 )
 
+            # Structured alert event. This is the production-friendly output.
+            log_event(
+                logger,
+                {
+                    "event": "classification",
+                    "ts": time.time(),
+                    "pid": features.get("pid"),
+                    "name": features.get("name"),
+                    "score": final_score,
+                    "verdict": verdict,
+                    "confidence": confidence,
+                    "local_reasons": features.get("local_reasons"),
+                    "model_reasons": model_reasons,
+                    "remote_connection_count": int(features.get("remote_connection_count") or 0),
+                    "beacon_likeness": int(features.get("beacon_likeness") or 0),
+                },
+            )
+
             if ai_print_pid_expl and pid_explanation:
                 print(f"[AI] PID explanation: {pid_explanation}")
 
@@ -780,6 +975,18 @@ def main():
             print(
                 f"[cycle] scanned={scanned_count} ps_seen={powershell_seen_count} "
                 f"scored={nonzero_score_count} ai={escalated_to_ai_count}"
+            )
+
+            log_event(
+                logger,
+                {
+                    "event": "cycle_summary",
+                    "ts": time.time(),
+                    "scanned": scanned_count,
+                    "ps_seen": powershell_seen_count,
+                    "scored": nonzero_score_count,
+                    "ai": escalated_to_ai_count,
+                },
             )
 
         time.sleep(poll_seconds)
