@@ -29,6 +29,31 @@ from google import genai
 client = genai.Client()
 
 
+def trunc(s: str, max_len: int = 160) -> str:
+    """Return a single-line truncated string for console-safe display."""
+    s = (s or "").replace("\r", " ").replace("\n", " ").strip()
+    return s if len(s) <= max_len else (s[: max_len - 1] + "…")
+
+
+def fmt_ai_summary(
+    *,
+    pid: Any,
+    name: Any,
+    score: int,
+    verdict: Optional[str],
+    confidence: Any,
+    reasons: Optional[List[str]],
+    conn_count: int,
+) -> str:
+    verdict_s = verdict or "unknown"
+    conf_s = "?" if confidence is None else str(confidence)
+    top_reasons = ", ".join((reasons or [])[:3])
+    return (
+        f"[AI] pid={pid} name={name} score={score} remotes={conn_count} "
+        f"verdict={verdict_s} confidence={conf_s} reasons=[{trunc(top_reasons, 140)}]"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Process collection and low-cost local heuristics
 # ---------------------------------------------------------------------------
@@ -269,9 +294,23 @@ def classify_process_behavior(prompt: str) -> str:
     Configuration:
         ML_DETECTOR_MODEL: model name (default: gemma-4-31b-it)
     """
-    model_name = os.getenv("ML_DETECTOR_MODEL", "gemma-4-31b-it")
-    response = client.models.generate_content(model=model_name, contents=prompt)
-    return response.text
+    try:
+        response = client.models.generate_content(model="gemma-4-31b-it", contents=prompt)
+        return response.text or ""
+    except Exception as e:
+        # Keep the monitor running even if the model call fails.
+        return json.dumps(
+            {
+                "verdict": "suspicious",
+                "confidence": 0,
+                "reasons": [f"model_call_failed: {type(e).__name__}: {e}"],
+                "process_id_explanation": (
+                    "PID is the operating system's identifier for a running process. "
+                    "Use it to correlate this alert with Task Manager, process command line, and network connections."
+                ),
+            },
+            ensure_ascii=False,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -280,29 +319,44 @@ def classify_process_behavior(prompt: str) -> str:
 
 def main():
     print("Initializing AI model...")
-    response = client.models.generate_content(
-        model="gemma-4-31b-it", contents="Explain how AI works in a few words in simple terms, specifically focusing on cybersecurity."
-    )
-    print(f"Response text: {response.text}")
+    try:
+        response = client.models.generate_content(
+            model="gemma-4-31b-it",
+            contents=(
+                "Explain how AI works in a few words in simple terms, specifically focusing on cybersecurity."
+            ),
+        )
+        print(f"Response text: {response.text}")
+    except Exception as e:
+        print(f"[warn] AI init failed ({type(e).__name__}): {e}")
+        print("[warn] Continuing; AI classifications may fail until configured.")
     print("----------------------------------------------------------------")
     print("Monitoring running processes. Press Ctrl+C to stop.")
 
-        # Tuning knobs (environment variables)
-        # - ML_DETECTOR_POLL_SECONDS: polling interval
-        # - ML_DETECTOR_MAX_PER_CYCLE: max candidates sent to AI per poll
-        # - ML_DETECTOR_MIN_SCORE: minimum local heuristic score before AI
-        # - ML_DETECTOR_SCAN_MODE: "new" (default) or "all"
-        #       new: only processes first observed after the detector starts
-        #       all: re-check running processes each poll (with throttle)
-        # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
+    # Tuning knobs (environment variables)
+    # - ML_DETECTOR_POLL_SECONDS: polling interval
+    # - ML_DETECTOR_MIN_SCORE: minimum local heuristic score before AI
+    # - ML_DETECTOR_SCAN_MODE: "new" (default) or "all"
+    #       new: only processes first observed after the detector starts
+    #       all: re-check running processes each poll (with throttle)
+    # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
     poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "5"))
     min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "2"))
+    max_ai_per_cycle = int(os.getenv("ML_DETECTOR_MAX_AI_PER_CYCLE", "3"))
 
     # For LiveMode beaconing, "all" is usually the right default because
     # the PowerShell host process may already exist before the detector starts.
     scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "all").strip().lower()
     debug = get_env_bool("ML_DETECTOR_DEBUG", False)
     show_scores = get_env_bool("ML_DETECTOR_SHOW_SCORES", True)
+
+    # Output controls:
+    # - ML_DETECTOR_AI_VERBOSE=1 -> print full features + raw model output
+    # - ML_DETECTOR_AI_PRINT_PID_EXPLANATION=1 -> print PID explanation line
+    # - ML_DETECTOR_MONITOR_PRINT_CMDLINE=1 -> include cmdline (truncated) in monitor lines
+    ai_verbose = get_env_bool("ML_DETECTOR_AI_VERBOSE", False)
+    ai_print_pid_expl = get_env_bool("ML_DETECTOR_AI_PRINT_PID_EXPLANATION", False)
+    monitor_print_cmdline = get_env_bool("ML_DETECTOR_MONITOR_PRINT_CMDLINE", False)
 
     # In "all" mode, avoid hammering the same long-running process.
     # Re-check a (pid, cmdline) at most every N seconds.
@@ -387,22 +441,17 @@ def main():
                 # Reduce noise: only print per-process lines when there's any local signal.
                 # Also print PowerShell-family processes so demos are easier to follow.
                 if score > 0 or is_ps:
+                    cmd_part = ""
+                    if monitor_print_cmdline:
+                        cmd_part = f" cmdline={trunc(str(features.get('cmdline') or ''), 120)}"
                     print(
                         f"[monitor] pid={features.get('pid')} name={features.get('name')} "
                         f"score={features.get('local_score')} reasons={features.get('local_reasons')} "
-                        f"remotes={features.get('remote_connection_count', 0)}"
+                        f"remotes={features.get('remote_connection_count', 0)}" + cmd_part
                     )
 
-            pid = features.get("pid")
-            create_time = features.get("create_time")
-            cmd_hash = hash(features.get("cmdline") or "")
-            proc_key = (
-                int(pid) if isinstance(pid, int) else -1,
-                float(create_time) if isinstance(create_time, (int, float)) else None,
-                cmd_hash,
-            )
-
             # Additional throttle for scan_mode=all
+            pid = features.get("pid")
             pid_i = int(pid) if isinstance(pid, int) else -1
             cmd_hash2 = hash(features.get("cmdline") or "")
             throttle_key = (pid_i, cmd_hash2)
@@ -426,25 +475,46 @@ def main():
                 continue
 
             escalated_to_ai_count += 1
+            if escalated_to_ai_count > max_ai_per_cycle:
+                if debug:
+                    print(f"[debug] max-ai-per-cycle reached ({max_ai_per_cycle}); skipping remaining")
+                break
             prompt = build_model_prompt(features, score, reasons)
             result = classify_process_behavior(prompt)
             parsed = parse_model_json(result)
 
-            # Step 5: output + optional logging of suspicious/malicious verdicts
-            print("\n[AI] Process classification:")
-            print(json.dumps(features, indent=2))
-            print(result)
-
             verdict = None
             confidence = None
             pid_explanation = None
+            model_reasons: Optional[List[str]] = None
             if parsed:
                 verdict = (parsed.get("verdict") or "").lower()
                 confidence = parsed.get("confidence")
                 pid_explanation = parsed.get("process_id_explanation")
+                if isinstance(parsed.get("reasons"), list):
+                    model_reasons = [str(x) for x in parsed.get("reasons") if x is not None]
 
-            if pid_explanation:
+            # Step 5: compact output by default (verbose mode shows full dumps)
+            print(
+                fmt_ai_summary(
+                    pid=features.get("pid"),
+                    name=features.get("name"),
+                    score=int(features.get("local_score") or score),
+                    verdict=verdict,
+                    confidence=confidence,
+                    reasons=model_reasons,
+                    conn_count=int(features.get("remote_connection_count") or 0),
+                )
+            )
+
+            if ai_print_pid_expl and pid_explanation:
                 print(f"[AI] PID explanation: {pid_explanation}")
+
+            if ai_verbose:
+                print("[AI] Features:")
+                print(json.dumps(features, indent=2))
+                print("[AI] Raw model output:")
+                print(result)
 
             if verdict in {"suspicious", "malicious"}:
                 with open("suspicious_processes.log", "a", encoding="utf-8") as log_file:
