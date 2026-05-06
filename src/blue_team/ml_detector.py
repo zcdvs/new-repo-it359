@@ -2,8 +2,8 @@
 Machine Learning-Based Fileless Malware Detector
 IT 359 Final Project - Fileless Malware Research
 
-This script uses an AI model (via the college's OpenWebUI /api/chat/completions
-endpoint) to classify process behavior as benign or potentially malicious.
+This script uses an AI model (via the Gemini API) to classify process behavior
+as benign or potentially malicious.
 
 It builds on the same behavioral ideas as detector.py, but instead of
 hard-coded rules, it sends process features to the AI model and
@@ -29,12 +29,26 @@ from google import genai
 client = genai.Client()
 
 
+# ---------------------------------------------------------------------------
+# Process collection and low-cost local heuristics
+# ---------------------------------------------------------------------------
+
+
 def iter_processes() -> List[Dict[str, Any]]:
     """Return a snapshot of running processes with common fields.
 
     Notes:
     - Cross-platform via psutil.
     - Some fields may be missing due to permissions; we default safely.
+
+    Returns:
+        A list of dicts. Each dict attempts to include:
+        - pid (int)
+        - name (str)
+        - cmdline (str)
+        - user (str)
+        - host (str)
+        - create_time (float | None)
     """
 
     host = socket.gethostname()
@@ -68,7 +82,10 @@ def iter_processes() -> List[Dict[str, Any]]:
 def looks_suspicious(proc: Dict[str, Any]) -> bool:
     """Cheap local pre-filter to avoid sending every process to the model.
 
-    Prefer high-signal command-line indicators over just process name.
+    This is intentionally conservative: it should reduce AI calls and noise.
+
+    Current implementation focuses on PowerShell/pwsh plus common fileless
+    indicators (encoded commands, hidden windows, download cradles, etc.).
     """
     name = (proc.get("name") or "").lower()
     cmd = (proc.get("cmdline") or "").lower()
@@ -99,7 +116,15 @@ def looks_suspicious(proc: Dict[str, Any]) -> bool:
 
 
 def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
-    """Return (score, reasons) based on local heuristics."""
+    """Return (score, reasons) based on local heuristics.
+
+    This is a lightweight scoring step used to decide whether a process is
+    worth sending to the LLM.
+
+    Returns:
+        score: Integer risk score (higher = more suspicious)
+        reasons: Human-readable list of why points were added
+    """
 
     cmd = (proc.get("cmdline") or "")
     cmd_l = cmd.lower()
@@ -130,6 +155,12 @@ def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
 
 
 def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str]) -> str:
+    """Build an instruction prompt that requests strict JSON from the model.
+
+    Why JSON?
+    - It reduces the need for brittle substring matching (e.g., "malicious").
+    - It makes logging and downstream automation easier.
+    """
     return (
         "You are a blue-team process-behavior classifier. "
         "Given process features, return STRICT JSON ONLY (no markdown) with keys: "
@@ -141,7 +172,12 @@ def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str])
 
 
 def parse_model_json(text: str) -> Optional[Dict[str, Any]]:
-    """Attempt to parse JSON even if the model prepends/appends extra text."""
+    """Attempt to parse JSON even if the model prepends/appends extra text.
+
+    Models sometimes wrap JSON in prose. This helper tries:
+    1) Parse the entire response as JSON.
+    2) If that fails, extract the first {...} block and parse it.
+    """
     if not text:
         return None
 
@@ -166,10 +202,19 @@ def parse_model_json(text: str) -> Optional[Dict[str, Any]]:
 
 
 def classify_process_behavior(prompt: str) -> str:
-    """Send a single prompt to the model and return raw text."""
+    """Send a single prompt to the model and return raw text.
+
+    Configuration:
+        ML_DETECTOR_MODEL: model name (default: gemini-3-flash-preview)
+    """
     model_name = os.getenv("ML_DETECTOR_MODEL", "gemini-3-flash-preview")
     response = client.models.generate_content(model=model_name, contents=prompt)
     return response.text
+
+
+# ---------------------------------------------------------------------------
+# Main monitoring loop
+# ---------------------------------------------------------------------------
 
 def main():
     try:
@@ -181,28 +226,38 @@ def main():
         print("----------------------------------------------------------------")
         print("Monitoring running processes. Press Ctrl+C to stop.")
 
+        # Tuning knobs (environment variables)
+        # - ML_DETECTOR_POLL_SECONDS: polling interval
+        # - ML_DETECTOR_MAX_PER_CYCLE: max candidates sent to AI per poll
+        # - ML_DETECTOR_MIN_SCORE: minimum local heuristic score before AI
         poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "2"))
         max_per_cycle = int(os.getenv("ML_DETECTOR_MAX_PER_CYCLE", "3"))
         min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "5"))
 
-        # Dedupe: remember which processes we've already scored (pid, create_time, cmdline hash)
+        # Dedupe:
+        #   Track which process instances have already been escalated to the AI.
+        #   This prevents repeated queries for the same long-running process.
         seen_keys: set[Tuple[int, Optional[float], int]] = set()
+
+        # Tracking set used to detect *new* processes between polls.
         known_pids: set[int] = set()
 
         while True:
             snapshot = iter_processes()
 
-            # Track new processes since last poll (lightweight detection signal)
+            # Detect newly observed PIDs since last poll.
+            # This keeps the detector "real-time" by focusing on fresh activity.
             new_procs = [p for p in snapshot if isinstance(p.get("pid"), int) and p["pid"] not in known_pids]
             for p in new_procs:
                 known_pids.add(p["pid"])
 
-            # Only consider candidates with a meaningful signal.
+            # Step 1: low-cost pre-filter (avoid AI on everything)
             candidates = [p for p in new_procs if looks_suspicious(p)]
             if not candidates:
                 time.sleep(poll_seconds)
                 continue
 
+            # Step 2: cap throughput (cost control)
             to_check = candidates[:max_per_cycle]
             for proc in to_check:
                 features = {
@@ -214,6 +269,7 @@ def main():
                     "create_time": proc.get("create_time"),
                 }
 
+                # Step 3: local scoring (avoid AI unless there's enough signal)
                 score, reasons = local_risk_score(proc)
                 features["local_score"] = score
                 features["local_reasons"] = reasons
@@ -222,11 +278,12 @@ def main():
                 create_time = features.get("create_time")
                 cmd_hash = hash(features.get("cmdline") or "")
                 proc_key = (int(pid) if isinstance(pid, int) else -1, float(create_time) if isinstance(create_time, (int, float)) else None, cmd_hash)
+                # Step 4: dedupe AI calls per process instance
                 if proc_key in seen_keys:
                     continue
                 seen_keys.add(proc_key)
 
-                # Only escalate to AI if score is high enough
+                # Step 5: AI escalation threshold
                 if score < min_score_for_ai:
                     continue
 
@@ -234,6 +291,7 @@ def main():
                 result = classify_process_behavior(prompt)
                 parsed = parse_model_json(result)
 
+                # Step 6: output + optional logging of suspicious/malicious verdicts
                 print("\n[AI] Process classification:")
                 print(json.dumps(features, indent=2))
                 print(result)
