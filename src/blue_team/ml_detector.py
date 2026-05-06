@@ -103,7 +103,7 @@ def looks_suspicious(proc: Dict[str, Any]) -> bool:
         "-w hidden",
         "-windowstyle hidden",
         "invoke-expression",
-    "iex",
+        "iex",
         "frombase64string",
         "downloadstring",
         "downloaddata",
@@ -113,6 +113,25 @@ def looks_suspicious(proc: Dict[str, Any]) -> bool:
     ]
 
     return any(k in cmd for k in high_signal)
+
+
+def is_powershell_family(proc: Dict[str, Any]) -> bool:
+    """True for PowerShell-style processes.
+
+    This is used for a broader "real-time monitor" mode where we may want to
+    at least score/log PowerShell sessions even if their command line is bland.
+    """
+
+    name = (proc.get("name") or "").lower()
+    return "powershell" in name or "pwsh" in name
+
+
+def get_env_bool(name: str, default: bool) -> bool:
+    """Parse environment variable booleans like 1/0, true/false, yes/no."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
@@ -164,7 +183,7 @@ def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str])
     return (
         "You are a blue-team process-behavior classifier. "
         "Given process features, return STRICT JSON ONLY (no markdown) with keys: "
-        "verdict (one of benign|suspicious|malicious), confidence (0-1), reasons (array of strings).\n"
+        "verdict (one of benign|suspicious|malicious), confidence (0-10), reasons (array of strings).\n"
         f"LocalHeuristicScore: {score}\n"
         f"LocalHeuristicReasons: {reasons}\n"
         f"ProcessFeatures: {json.dumps(features, ensure_ascii=False)}\n"
@@ -230,9 +249,20 @@ def main():
         # - ML_DETECTOR_POLL_SECONDS: polling interval
         # - ML_DETECTOR_MAX_PER_CYCLE: max candidates sent to AI per poll
         # - ML_DETECTOR_MIN_SCORE: minimum local heuristic score before AI
+        # - ML_DETECTOR_SCAN_MODE: "new" (default) or "all"
+        #       new: only processes first observed after the detector starts
+        #       all: re-check running processes each poll (with throttle)
+        # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
         poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "2"))
         max_per_cycle = int(os.getenv("ML_DETECTOR_MAX_PER_CYCLE", "3"))
         min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "5"))
+        scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "new").strip().lower()
+        debug = get_env_bool("ML_DETECTOR_DEBUG", False)
+
+        # In "all" mode, avoid hammering the same long-running process.
+        # Re-check a (pid, cmdline) at most every N seconds.
+        throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
+        last_checked: Dict[Tuple[int, int], float] = {}
 
         # Dedupe:
         #   Track which process instances have already been escalated to the AI.
@@ -245,14 +275,21 @@ def main():
         while True:
             snapshot = iter_processes()
 
-            # Detect newly observed PIDs since last poll.
-            # This keeps the detector "real-time" by focusing on fresh activity.
-            new_procs = [p for p in snapshot if isinstance(p.get("pid"), int) and p["pid"] not in known_pids]
-            for p in new_procs:
-                known_pids.add(p["pid"])
+            # Choose candidates depending on scan mode.
+            # - new: only look at newly observed PIDs
+            # - all: look at all running processes each poll (throttled)
+            if scan_mode == "all":
+                procs = [p for p in snapshot if isinstance(p.get("pid"), int)]
+            else:
+                procs = [p for p in snapshot if isinstance(p.get("pid"), int) and p["pid"] not in known_pids]
+                for p in procs:
+                    known_pids.add(p["pid"])
 
             # Step 1: low-cost pre-filter (avoid AI on everything)
-            candidates = [p for p in new_procs if looks_suspicious(p)]
+            # In a "real-time monitor" scenario, we still want observability.
+            # So we treat PowerShell-family processes as *monitorable* and then
+            # rely on scoring/threshold before AI escalation.
+            candidates = [p for p in procs if is_powershell_family(p)]
             if not candidates:
                 time.sleep(poll_seconds)
                 continue
@@ -274,6 +311,10 @@ def main():
                 features["local_score"] = score
                 features["local_reasons"] = reasons
 
+                # Optional: add a low-cost "suspicious cmdline" hint.
+                # If this is false and the score is low, it's likely benign.
+                features["cmdline_high_signal"] = looks_suspicious(proc)
+
                 pid = features.get("pid")
                 create_time = features.get("create_time")
                 cmd_hash = hash(features.get("cmdline") or "")
@@ -283,8 +324,25 @@ def main():
                     continue
                 seen_keys.add(proc_key)
 
+                # Additional throttle for scan_mode=all
+                pid_i = int(pid) if isinstance(pid, int) else -1
+                cmd_hash2 = hash(features.get("cmdline") or "")
+                throttle_key = (pid_i, cmd_hash2)
+                now = time.time()
+                last = last_checked.get(throttle_key)
+                if scan_mode == "all" and last is not None and (now - last) < throttle_seconds:
+                    if debug:
+                        print(f"[debug] throttled pid={pid_i} ({int(now - last)}s since last check)")
+                    continue
+                last_checked[throttle_key] = now
+
                 # Step 5: AI escalation threshold
                 if score < min_score_for_ai:
+                    if debug:
+                        print(
+                            f"[debug] skip-ai pid={features.get('pid')} name={features.get('name')} "
+                            f"score={score} reasons={reasons} cmdline_high_signal={features.get('cmdline_high_signal')}"
+                        )
                     continue
 
                 prompt = build_model_prompt(features, score, reasons)
