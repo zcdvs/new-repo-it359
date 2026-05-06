@@ -267,9 +267,9 @@ def classify_process_behavior(prompt: str) -> str:
     """Send a single prompt to the model and return raw text.
 
     Configuration:
-        ML_DETECTOR_MODEL: model name (default: gemini-3-flash-preview)
+        ML_DETECTOR_MODEL: model name (default: gemma-4-31b-it)
     """
-    model_name = os.getenv("ML_DETECTOR_MODEL", "gemini-3-flash-preview")
+    model_name = os.getenv("ML_DETECTOR_MODEL", "gemma-4-31b-it")
     response = client.models.generate_content(model=model_name, contents=prompt)
     return response.text
 
@@ -281,7 +281,7 @@ def classify_process_behavior(prompt: str) -> str:
 def main():
     print("Initializing AI model...")
     response = client.models.generate_content(
-        model="gemini-3-flash-preview", contents="Explain how AI works in a few words in simple terms, specifically focusing on cybersecurity."
+        model="gemma-4-31b-it", contents="Explain how AI works in a few words in simple terms, specifically focusing on cybersecurity."
     )
     print(f"Response text: {response.text}")
     print("----------------------------------------------------------------")
@@ -295,9 +295,8 @@ def main():
         #       new: only processes first observed after the detector starts
         #       all: re-check running processes each poll (with throttle)
         # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
-    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "2"))
-    max_per_cycle = int(os.getenv("ML_DETECTOR_MAX_PER_CYCLE", "3"))
-    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "3"))
+    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "5"))
+    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "2"))
 
     # For LiveMode beaconing, "all" is usually the right default because
     # the PowerShell host process may already exist before the detector starts.
@@ -309,11 +308,6 @@ def main():
     # Re-check a (pid, cmdline) at most every N seconds.
     throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
     last_checked: Dict[Tuple[int, int], float] = {}
-
-    # Dedupe:
-    #   Track which process instances have already been escalated to the AI.
-    #   This prevents repeated queries for the same long-running process.
-    seen_keys: set[Tuple[int, Optional[float], int]] = set()
 
     # Tracking set used to detect *new* processes between polls.
     known_pids: set[int] = set()
@@ -336,8 +330,7 @@ def main():
                 known_pids.add(p["pid"])
 
         # Step 1: cap throughput (cost control)
-        to_check = procs[:max_per_cycle]
-        for proc in to_check:
+        for proc in procs:
             features = {
                 "pid": proc.get("pid"),
                 "name": proc.get("name"),
@@ -354,16 +347,15 @@ def main():
 
             # LiveMode behavior signal: PowerShell process making outbound connections.
             pid_val = features.get("pid")
-            if isinstance(pid_val, int) and pid_val > 0:
-                conn_count, remotes = count_remote_connections(pid_val)
-                features["remote_connection_count"] = conn_count
-                features["remote_endpoints"] = remotes
-                if conn_count > 0:
-                    # Weight network activity for PowerShell fairly high.
-                    score += 4
-                    reasons.append("outbound network connections")
-                    features["local_score"] = score
-                    features["local_reasons"] = reasons
+            conn_count, remotes = count_remote_connections(pid_val)
+            features["remote_connection_count"] = conn_count
+            features["remote_endpoints"] = remotes
+            if conn_count > 0:
+                # Weight network activity for PowerShell fairly high.
+                score += 4
+                reasons.append("outbound network connections")
+                features["local_score"] = score
+                features["local_reasons"] = reasons
 
             # Optional: add a low-cost "suspicious cmdline" hint.
             # If this is false and the score is low, it's likely benign.
@@ -384,10 +376,6 @@ def main():
                 float(create_time) if isinstance(create_time, (int, float)) else None,
                 cmd_hash,
             )
-            # Step 3: dedupe AI calls per process instance
-            if proc_key in seen_keys:
-                continue
-            seen_keys.add(proc_key)
 
             # Additional throttle for scan_mode=all
             pid_i = int(pid) if isinstance(pid, int) else -1
