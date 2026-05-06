@@ -20,7 +20,8 @@ import os
 import re
 import socket
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from collections import deque
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import psutil
 from google import genai
@@ -297,6 +298,79 @@ def count_remote_connections(pid: int) -> Tuple[int, List[str]]:
     return len(remotes_unique), remotes_unique
 
 
+def _interval_stats(ts: List[float]) -> Tuple[Optional[float], Optional[float]]:
+    """Return (mean_interval, jitter) for a timestamp series.
+
+    jitter is the mean absolute deviation from mean_interval.
+    """
+
+    if len(ts) < 3:
+        return None, None
+    intervals = [ts[i] - ts[i - 1] for i in range(1, len(ts))]
+    mean_i = sum(intervals) / len(intervals)
+    mad = sum(abs(x - mean_i) for x in intervals) / len(intervals)
+    return mean_i, mad
+
+
+def compute_beacon_likeness(
+    *,
+    timestamps: List[float],
+    remote_counts: List[int],
+    remote_endpoints: List[List[str]],
+) -> Tuple[int, List[str]]:
+    """Return (beacon_likeness_score 0-10, reasons).
+
+    Heuristics (intentionally simple / hacktool-ish):
+    - Regular-ish periodic activity (low jitter): common for beacon loops.
+    - Short reconnect patterns: remote_count toggles 0->>0 repeatedly.
+    - Repeatedly contacting the same endpoint(s).
+    """
+
+    reasons: List[str] = []
+    if len(timestamps) < 3:
+        return 0, reasons
+
+    mean_i, jitter = _interval_stats(timestamps)
+    score = 0
+
+    # 1) Periodicity signal
+    if mean_i is not None and jitter is not None and mean_i > 0:
+        # Relative jitter (lower is "more periodic")
+        rel = jitter / mean_i
+        # Typical beacon intervals are often 2s+; still allow small loops for demos.
+        if mean_i >= 2 and rel <= 0.35:
+            score += 5
+            reasons.append(f"periodic callbacks (avg={mean_i:.1f}s jitter={rel:.2f})")
+        elif mean_i >= 2 and rel <= 0.6:
+            score += 3
+            reasons.append(f"semi-periodic callbacks (avg={mean_i:.1f}s jitter={rel:.2f})")
+
+    # 2) Connection toggling/reconnect behavior
+    transitions = 0
+    for i in range(1, len(remote_counts)):
+        if (remote_counts[i - 1] == 0) != (remote_counts[i] == 0):
+            transitions += 1
+    if transitions >= 2:
+        score += 2
+        reasons.append("repeated connect/disconnect pattern")
+
+    # 3) Same endpoint repetition (sticky destination)
+    flat = [ep for eps in remote_endpoints for ep in eps]
+    if flat:
+        # Count duplicates
+        uniq = set(flat)
+        if len(uniq) == 1 and len(flat) >= 3:
+            score += 3
+            reasons.append("repeatedly contacts same remote endpoint")
+        elif len(uniq) <= 2 and len(flat) >= 4:
+            score += 2
+            reasons.append("contacts small set of remote endpoints")
+
+    # Clamp 0-10
+    score = max(0, min(10, score))
+    return score, reasons
+
+
 def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str]) -> str:
     """Build an instruction prompt that requests strict JSON from the model.
 
@@ -306,6 +380,7 @@ def build_model_prompt(features: Dict[str, Any], score: int, reasons: List[str])
     """
     return (
         "You are a blue-team process-behavior classifier. "
+    "You may use timing/periodicity features (beacon_likeness) to detect C2-style beaconing. "
         "Return STRICT JSON ONLY (no markdown, no prose, no code fences). "
         "The JSON object MUST have exactly these keys: "
         "verdict, confidence, reasons, process_id_explanation. "
@@ -423,6 +498,10 @@ def main():
     write_alert_log = get_env_bool("ML_DETECTOR_WRITE_ALERT_LOG", False)
     alert_log_path = os.getenv("ML_DETECTOR_ALERT_LOG_PATH", "suspicious_processes.log")
 
+    # Reduce noise: by default only treat outbound network connections as a strong
+    # signal for PowerShell-family processes (common for fileless toolchains).
+    net_boost_powershell_only = get_env_bool("ML_DETECTOR_NET_BOOST_POWERSHELL_ONLY", True)
+
     # In "all" mode, avoid hammering the same long-running process.
     # Re-check a (pid, cmdline) at most every N seconds.
     throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
@@ -430,6 +509,13 @@ def main():
 
     # Tracking set used to detect *new* processes between polls.
     known_pids: set[int] = set()
+
+    # Per-PID time series used for beacon-likeness scoring.
+    # Stores only recent samples to keep memory bounded.
+    beacon_history_seconds = float(os.getenv("ML_DETECTOR_BEACON_WINDOW_SECONDS", "120"))
+    beacon_min_samples = int(os.getenv("ML_DETECTOR_BEACON_MIN_SAMPLES", "4"))
+    # pid -> deque of (timestamp, conn_count, remotes)
+    beacon_hist: Dict[int, Deque[Tuple[float, int, List[str]]]] = {}
 
     # Optional: read PowerShell history once per cycle (Windows) for interactive commands.
     # This is intentionally coarse and should only be used in controlled lab environments.
@@ -510,12 +596,57 @@ def main():
                     conn_count, remotes = count_remote_connections(pid_val)
                 except Exception:
                     conn_count, remotes = 0, []
-                if conn_count > 0:
+                is_ps_for_net = is_powershell_family(proc)
+                net_boost_allowed = (not net_boost_powershell_only) or is_ps_for_net
+
+                if conn_count > 0 and net_boost_allowed:
                     # Weight network activity fairly high.
                     score += 4
                     reasons.append("outbound network connections")
                     features["local_score"] = score
                     features["local_reasons"] = reasons
+
+                # Beacon-likeness (rate-based) — doesn't rely on a fixed C2 IP.
+                # We score based on periodic connection behavior for processes
+                # that exhibit outbound network activity.
+                now_ts = time.time()
+                if net_boost_allowed:
+                    dq = beacon_hist.get(pid_val)
+                    if dq is None:
+                        dq = deque(maxlen=200)
+                        beacon_hist[pid_val] = dq
+                    dq.append((now_ts, int(conn_count), list(remotes)))
+
+                # Evict old samples outside the window.
+                    cutoff = now_ts - beacon_history_seconds
+                    while dq and dq[0][0] < cutoff:
+                        dq.popleft()
+
+                    if len(dq) >= beacon_min_samples:
+                        ts = [x[0] for x in dq]
+                        counts = [x[1] for x in dq]
+                        rem_series = [x[2] for x in dq]
+                        bl_score, bl_reasons = compute_beacon_likeness(
+                            timestamps=ts,
+                            remote_counts=counts,
+                            remote_endpoints=rem_series,
+                        )
+                        features["beacon_likeness"] = bl_score
+                        features["beacon_reasons"] = bl_reasons
+                        if bl_score >= 6:
+                            score += 4
+                            reasons.append("beacon-like periodic callback pattern")
+                        elif bl_score >= 3:
+                            score += 2
+                            reasons.append("possible beacon-like timing")
+                        features["local_score"] = score
+                        features["local_reasons"] = reasons
+                    else:
+                        features["beacon_likeness"] = 0
+                        features["beacon_reasons"] = []
+                else:
+                    features["beacon_likeness"] = 0
+                    features["beacon_reasons"] = []
 
             features["remote_connection_count"] = conn_count
             features["remote_endpoints"] = remotes
