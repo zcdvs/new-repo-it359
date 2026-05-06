@@ -232,12 +232,16 @@ def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
         (r"(?<![a-zA-Z0-9])blob:(?![a-zA-Z0-9])", 4, "blob URI"),
         (r"(?<![a-zA-Z0-9])file:(?![a-zA-Z0-9])", 4, "file URI"),
         (r"(?<![a-zA-Z0-9])http(?![a-zA-Z0-9])", 2, "HTTP in cmdline"),
-    (r"(?<![a-zA-Z0-9])invoke-webrequest(?![a-zA-Z0-9])", 3, "Invoke-WebRequest"),
-    # If the script is launched with -File, the cmdline may not show IEX/etc.
-    # Catch our lab simulation script/file name as a high-signal indicator.
-    (r"fileless_simulation\.ps1", 6, "fileless simulation script"),
-    # Catch key function names from the simulation even if invoked indirectly.
-    (r"\b(send-beacon|invoke-memoryexecution|get-systemrecon|show-registrypersistence)\b", 4, "matches simulation technique name"),
+        (r"(?<![a-zA-Z0-9])invoke-webrequest(?![a-zA-Z0-9])", 3, "Invoke-WebRequest"),
+        # If the script is launched with -File, the cmdline may not show IEX/etc.
+        # Catch our lab simulation script/file name as a high-signal indicator.
+        (r"fileless_simulation\.ps1", 6, "fileless simulation script"),
+        # Catch key function names from the simulation even if invoked indirectly.
+        (
+            r"\b(send-beacon|invoke-memoryexecution|get-systemrecon|show-registrypersistence)\b",
+            4,
+            "matches simulation technique name",
+        ),
     ]
 
     for pattern, pts, label in indicators:
@@ -486,7 +490,14 @@ def main():
     # the PowerShell host process may already exist before the detector starts.
     scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "all").strip().lower()
     debug = get_env_bool("ML_DETECTOR_DEBUG", False)
-    show_scores = get_env_bool("ML_DETECTOR_SHOW_SCORES", True)
+    # Console output mode:
+    # - quiet (default): only prints AI alerts + periodic cycle summary
+    # - monitor: prints per-process monitor lines (noisy)
+    output_mode = os.getenv("ML_DETECTOR_OUTPUT_MODE", "quiet").strip().lower()
+    show_scores = output_mode == "monitor"
+    # If you still want some basic liveness output in quiet mode.
+    cycle_summary_every = int(os.getenv("ML_DETECTOR_CYCLE_SUMMARY_EVERY", "6"))
+    alert_score_threshold = int(os.getenv("ML_DETECTOR_ALERT_SCORE_THRESHOLD", "4"))
 
     # Output controls:
     # - ML_DETECTOR_AI_VERBOSE=1 -> print full features + raw model output
@@ -529,7 +540,9 @@ def main():
         "encodedcommand",
     }
 
+    cycle_no = 0
     while True:
+        cycle_no += 1
         ps_history_lines = maybe_read_powershell_history_lines()
         ps_hist_hit = any(
             any(ind in f" {ln} " for ind in ps_hist_indicators) for ln in ps_history_lines
@@ -556,7 +569,7 @@ def main():
             for p in procs:
                 known_pids.add(p["pid"])
 
-        # Step 1: iterate candidates
+    # Step 1: iterate candidates
         for proc in procs:
             scanned_count += 1
             features = {
@@ -586,7 +599,7 @@ def main():
             if score > 0:
                 nonzero_score_count += 1
 
-            # LiveMode behavior signal: PowerShell process making outbound connections.
+            # LiveMode behavior signal: outbound connections.
             pid_val = features.get("pid")
             conn_count = 0
             remotes: List[str] = []
@@ -599,10 +612,10 @@ def main():
                 is_ps_for_net = is_powershell_family(proc)
                 net_boost_allowed = (not net_boost_powershell_only) or is_ps_for_net
 
+                # Only treat outbound networking as a *strong* signal for PowerShell by default.
                 if conn_count > 0 and net_boost_allowed:
-                    # Weight network activity fairly high.
-                    score += 4
-                    reasons.append("outbound network connections")
+                    score += 3
+                    reasons.append("PowerShell outbound network activity")
                     features["local_score"] = score
                     features["local_reasons"] = reasons
 
@@ -633,12 +646,14 @@ def main():
                         )
                         features["beacon_likeness"] = bl_score
                         features["beacon_reasons"] = bl_reasons
+                        # Beacon-likeness is supplemental: it should not dominate.
+                        # Only add a small boost so cmdline/script indicators remain primary.
                         if bl_score >= 6:
-                            score += 4
-                            reasons.append("beacon-like periodic callback pattern")
+                            score += 1
+                            reasons.append("beacon-like timing (supplemental)")
                         elif bl_score >= 3:
-                            score += 2
-                            reasons.append("possible beacon-like timing")
+                            score += 1
+                            reasons.append("possible beacon timing (supplemental)")
                         features["local_score"] = score
                         features["local_reasons"] = reasons
                     else:
@@ -716,18 +731,20 @@ def main():
                 if isinstance(parsed.get("reasons"), list):
                     model_reasons = [str(x) for x in parsed.get("reasons") if x is not None]
 
-            # Step 5: compact output by default (verbose mode shows full dumps)
-            print(
-                fmt_ai_summary(
-                    pid=features.get("pid"),
-                    name=features.get("name"),
-                    score=int(features.get("local_score") or score),
-                    verdict=verdict,
-                    confidence=confidence,
-                    reasons=model_reasons,
-                    conn_count=int(features.get("remote_connection_count") or 0),
+            # Step 5: Print only actionable items in quiet mode.
+            final_score = int(features.get("local_score") or score)
+            if output_mode == "monitor" or final_score >= alert_score_threshold or verdict in {"suspicious", "malicious"}:
+                print(
+                    fmt_ai_summary(
+                        pid=features.get("pid"),
+                        name=features.get("name"),
+                        score=final_score,
+                        verdict=verdict,
+                        confidence=confidence,
+                        reasons=model_reasons,
+                        conn_count=int(features.get("remote_connection_count") or 0),
+                    )
                 )
-            )
 
             if ai_print_pid_expl and pid_explanation:
                 print(f"[AI] PID explanation: {pid_explanation}")
@@ -758,12 +775,11 @@ def main():
                     if debug:
                         print(f"[debug] failed writing alert log ({type(e).__name__}): {e}")
 
-        # Concise cycle summary so users can tell the tool is alive even when nothing is suspicious.
-        # Only emit when per-process printing didn't produce much signal.
-        if show_scores and (nonzero_score_count == 0 and escalated_to_ai_count == 0):
+        # Cycle summary (quiet mode): periodic single line so you know it’s alive.
+        if (not show_scores) and cycle_summary_every > 0 and (cycle_no % cycle_summary_every == 0):
             print(
-                f"[cycle] scanned={scanned_count} nonzero_scores={nonzero_score_count} "
-                f"powershell_seen={powershell_seen_count} escalated_to_ai={escalated_to_ai_count} (no alerts)"
+                f"[cycle] scanned={scanned_count} ps_seen={powershell_seen_count} "
+                f"scored={nonzero_score_count} ai={escalated_to_ai_count}"
             )
 
         time.sleep(poll_seconds)
