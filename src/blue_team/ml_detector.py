@@ -49,8 +49,8 @@ def fmt_ai_summary(
     conf_s = "?" if confidence is None else str(confidence)
     top_reasons = ", ".join((reasons or [])[:3])
     return (
-        f"[AI] pid={pid} name={name} score={score} remotes={conn_count} "
-        f"verdict={verdict_s} confidence={conf_s} reasons=[{trunc(top_reasons, 140)}]"
+        f"\n[AI] pid={pid} name={name} score={score} remotes={conn_count} "
+        f"verdict={verdict_s} confidence={conf_s} reasons=[{trunc(top_reasons, 140)}]\n"
     )
 
 
@@ -134,7 +134,7 @@ def looks_suspicious(proc: Dict[str, Any]) -> bool:
         "downloaddata",
         "invoke-webrequest",
         "invoke-restmethod",
-        "new-object net.webclient",
+        "new-object net.webclient"
     ]
 
     return any(k in cmd for k in map(str.lower, high_signal))
@@ -149,6 +149,47 @@ def is_powershell_family(proc: Dict[str, Any]) -> bool:
 
     name = (proc.get("name") or "").lower()
     return "powershell" in name or "pwsh" in name
+
+
+def maybe_read_powershell_history_lines(max_lines: int = 200) -> List[str]:
+    """Best-effort read of PowerShell PSReadLine history (Windows).
+
+    This is OPTIONAL and intended for lab demos when the cmdline doesn't include
+    the actual interactive commands (e.g., user types `iex ...` inside a shell).
+
+    Controlled by env var:
+      ML_DETECTOR_READ_PS_HISTORY=1
+
+    Returns:
+      A list of recent history lines (lowercased, stripped). On failure returns [].
+    """
+
+    if os.name != "nt":
+        return []
+
+    if os.getenv("ML_DETECTOR_READ_PS_HISTORY", "0").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+        "y",
+        "on",
+    }:
+        return []
+
+    appdata = os.getenv("APPDATA") or ""
+    if not appdata:
+        return []
+
+    # Typical path: %APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
+    hist_path = os.path.join(
+        appdata, "Microsoft", "Windows", "PowerShell", "PSReadLine", "ConsoleHost_history.txt"
+    )
+    try:
+        with open(hist_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = [ln.strip().lower() for ln in f.read().splitlines() if ln.strip()]
+        return lines[-max_lines:]
+    except Exception:
+        return []
 
 
 def get_env_bool(name: str, default: bool) -> bool:
@@ -190,7 +231,12 @@ def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
         (r"(?<![a-zA-Z0-9])blob:(?![a-zA-Z0-9])", 4, "blob URI"),
         (r"(?<![a-zA-Z0-9])file:(?![a-zA-Z0-9])", 4, "file URI"),
         (r"(?<![a-zA-Z0-9])http(?![a-zA-Z0-9])", 2, "HTTP in cmdline"),
-        (r"(?<![a-zA-Z0-9])Invoke-WebRequest(?![a-zA-Z0-9])", 3, "Invoke-WebRequest")
+    (r"(?<![a-zA-Z0-9])invoke-webrequest(?![a-zA-Z0-9])", 3, "Invoke-WebRequest"),
+    # If the script is launched with -File, the cmdline may not show IEX/etc.
+    # Catch our lab simulation script/file name as a high-signal indicator.
+    (r"fileless_simulation\.ps1", 6, "fileless simulation script"),
+    # Catch key function names from the simulation even if invoked indirectly.
+    (r"\b(send-beacon|invoke-memoryexecution|get-systemrecon|show-registrypersistence)\b", 4, "matches simulation technique name"),
     ]
 
     for pattern, pts, label in indicators:
@@ -223,11 +269,28 @@ def count_remote_connections(pid: int) -> Tuple[int, List[str]]:
             ip = getattr(c.raddr, "ip", None) or (c.raddr[0] if isinstance(c.raddr, tuple) else None)
             port = getattr(c.raddr, "port", None) or (c.raddr[1] if isinstance(c.raddr, tuple) else None)
             state = (c.status or "").upper()
-            if state in {"ESTABLISHED", "SYN_SENT"}:
+            # Include additional states that frequently show up during short beacons.
+            # TIME_WAIT/CLOSE_WAIT can still indicate recent outbound activity.
+            if state in {"ESTABLISHED", "SYN_SENT", "FIN_WAIT1", "FIN_WAIT2", "CLOSE_WAIT", "TIME_WAIT"}:
                 remotes.append(f"{ip}:{port}")
     except Exception:
-        # AccessDenied is common without admin; treat as unknown rather than failing.
-        return 0, []
+        # AccessDenied is common without admin on Windows; optionally fall back to a
+        # system-wide scan and filter by pid.
+        if os.getenv("ML_DETECTOR_CONN_FALLBACK", "1").strip().lower() not in {"1", "true", "yes", "y", "on"}:
+            return 0, []
+        try:
+            for c in psutil.net_connections(kind="inet"):
+                if getattr(c, "pid", None) != pid:
+                    continue
+                if not c.raddr:
+                    continue
+                ip = getattr(c.raddr, "ip", None) or (c.raddr[0] if isinstance(c.raddr, tuple) else None)
+                port = getattr(c.raddr, "port", None) or (c.raddr[1] if isinstance(c.raddr, tuple) else None)
+                state = (c.status or "").upper()
+                if state in {"ESTABLISHED", "SYN_SENT", "FIN_WAIT1", "FIN_WAIT2", "CLOSE_WAIT", "TIME_WAIT"}:
+                    remotes.append(f"{ip}:{port}")
+        except Exception:
+            return 0, []
 
     # Return unique endpoints but keep a stable list for logging.
     remotes_unique = sorted(set([r for r in remotes if r and "None" not in r]))
@@ -357,6 +420,8 @@ def main():
     ai_verbose = get_env_bool("ML_DETECTOR_AI_VERBOSE", False)
     ai_print_pid_expl = get_env_bool("ML_DETECTOR_AI_PRINT_PID_EXPLANATION", False)
     monitor_print_cmdline = get_env_bool("ML_DETECTOR_MONITOR_PRINT_CMDLINE", False)
+    write_alert_log = get_env_bool("ML_DETECTOR_WRITE_ALERT_LOG", False)
+    alert_log_path = os.getenv("ML_DETECTOR_ALERT_LOG_PATH", "suspicious_processes.log")
 
     # In "all" mode, avoid hammering the same long-running process.
     # Re-check a (pid, cmdline) at most every N seconds.
@@ -366,7 +431,23 @@ def main():
     # Tracking set used to detect *new* processes between polls.
     known_pids: set[int] = set()
 
+    # Optional: read PowerShell history once per cycle (Windows) for interactive commands.
+    # This is intentionally coarse and should only be used in controlled lab environments.
+    ps_hist_indicators = {
+        "invoke-expression",
+        " iex ",
+        "frombase64string",
+        "invoke-webrequest",
+        "invoke-restmethod",
+        "downloadstring",
+        "encodedcommand",
+    }
+
     while True:
+        ps_history_lines = maybe_read_powershell_history_lines()
+        ps_hist_hit = any(
+            any(ind in f" {ln} " for ind in ps_hist_indicators) for ln in ps_history_lines
+        )
         snapshot = iter_processes()
 
         # Per-cycle counters (for a concise "is it working?" summary)
@@ -405,6 +486,16 @@ def main():
             score, reasons = local_risk_score(proc)
             features["local_score"] = score
             features["local_reasons"] = reasons
+
+            # If enabled and we saw suspicious interactive history, boost PowerShell-family processes.
+            if ps_hist_hit and is_powershell_family(proc):
+                score += 3
+                reasons.append("suspicious PowerShell history (interactive)")
+                features["local_score"] = score
+                features["local_reasons"] = reasons
+                features["ps_history_signal"] = True
+            else:
+                features["ps_history_signal"] = False
 
             if score > 0:
                 nonzero_score_count += 1
@@ -516,21 +607,25 @@ def main():
                 print("[AI] Raw model output:")
                 print(result)
 
-            if verdict in {"suspicious", "malicious"}:
-                with open("suspicious_processes.log", "a", encoding="utf-8") as log_file:
-                    log_file.write(
-                        json.dumps(
-                            {
-                                "features": features,
-                                "verdict": verdict,
-                                "confidence": confidence,
-                                "process_id_explanation": pid_explanation,
-                                "model_output": parsed or result,
-                            },
-                            ensure_ascii=False,
+            if write_alert_log and verdict in {"suspicious", "malicious"}:
+                try:
+                    with open(alert_log_path, "a", encoding="utf-8") as log_file:
+                        log_file.write(
+                            json.dumps(
+                                {
+                                    "features": features,
+                                    "verdict": verdict,
+                                    "confidence": confidence,
+                                    "process_id_explanation": pid_explanation,
+                                    "model_output": parsed or result,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
                         )
-                        + "\n"
-                    )
+                except Exception as e:
+                    if debug:
+                        print(f"[debug] failed writing alert log ({type(e).__name__}): {e}")
 
         # Concise cycle summary so users can tell the tool is alive even when nothing is suspicious.
         # Only emit when per-process printing didn't produce much signal.
