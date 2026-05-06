@@ -360,7 +360,11 @@ def main():
             conn_count = 0
             remotes: List[str] = []
             if isinstance(pid_val, int) and pid_val > 0:
-                conn_count, remotes = count_remote_connections(pid_val)
+                # On Windows this can throw AccessDenied/NoSuchProcess mid-iteration.
+                try:
+                    conn_count, remotes = count_remote_connections(pid_val)
+                except Exception:
+                    conn_count, remotes = 0, []
                 if conn_count > 0:
                     # Weight network activity fairly high.
                     score += 4
