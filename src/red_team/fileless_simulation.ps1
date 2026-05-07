@@ -616,7 +616,7 @@ function Start-Simulation {
     Write-Host ""
     
     # Run Reconnaissance (always runs)
-    $reconData = Get-SystemRecon
+    Get-SystemRecon
     Write-Host ""
     
     # Execute techniques
