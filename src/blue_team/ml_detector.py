@@ -191,6 +191,7 @@ def fmt_alert_line(
     name: Any,
     score: int,
     remotes: int,
+    loopback: int = 0,
     beacon: int,
     reasons: List[str],
     cmdline: str = "",
@@ -200,8 +201,9 @@ def fmt_alert_line(
     """Single-line console output to keep output readable."""
     rs = ",".join([trunc(str(r), 60) for r in (reasons or [])[:max_reasons]])
     cmd_part = f" cmd={trunc(cmdline, max_cmd)}" if cmdline else ""
+    loop_part = f" loop={loopback}" if loopback else ""
     return (
-        f"[{kind}] pid={pid} name={name} score={score} remotes={remotes} "
+        f"[{kind}] pid={pid} name={name} score={score} remotes={remotes}{loop_part} "
         f"beacon={beacon} reasons={rs}{cmd_part}"
     )
 
@@ -215,6 +217,7 @@ def fmt_ai_block(
     confidence: Any,
     reasons: Optional[List[str]],
     remotes: int,
+    loopback: int = 0,
     beacon: int,
     wrap: int,
 ) -> str:
@@ -232,9 +235,10 @@ def fmt_ai_block(
     else:
         reasons_lines = f"  - {rs}"
 
+    loop_part = f" loop={loopback}" if loopback else ""
     return (
         "\n"
-        f"[AI] pid={pid} name={name} score={score} remotes={remotes} beacon={beacon} verdict={verdict_s} confidence={conf_s}\n"
+        f"[AI] pid={pid} name={name} score={score} remotes={remotes}{loop_part} beacon={beacon} verdict={verdict_s} confidence={conf_s}\n"
         f"[AI] reasons:\n{reasons_lines}\n"
     )
 
@@ -906,7 +910,8 @@ def main():
                             pid=features.get("pid"),
                             name=features.get("name"),
                             score=int(features.get("local_score") or 0),
-                            remotes=int(features.get("remote_connection_count") or 0),
+                            remotes=int(features.get("external_connection_count") or 0),
+                            loopback=len(list(features.get("loopback_endpoints") or [])),
                             beacon=int(features.get("beacon_likeness") or 0),
                             reasons=[str(x) for x in (features.get("local_reasons") or [])],
                             cmdline=cmdline,
@@ -1006,7 +1011,8 @@ def main():
                         pid=features.get("pid"),
                         name=features.get("name"),
                         score=final_score,
-                        remotes=int(features.get("remote_connection_count") or 0),
+                        remotes=int(features.get("external_connection_count") or 0),
+                        loopback=len(list(features.get("loopback_endpoints") or [])),
                         beacon=int(features.get("beacon_likeness") or 0),
                         reasons=[str(x) for x in (model_reasons or [])],
                     )
@@ -1020,7 +1026,8 @@ def main():
                         verdict=verdict,
                         confidence=confidence,
                         reasons=model_reasons,
-                        remotes=int(features.get("remote_connection_count") or 0),
+                        remotes=int(features.get("external_connection_count") or 0),
+                        loopback=len(list(features.get("loopback_endpoints") or [])),
                         beacon=int(features.get("beacon_likeness") or 0),
                         wrap=ai_wrap,
                     )
