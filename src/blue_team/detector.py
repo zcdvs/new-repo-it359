@@ -159,6 +159,83 @@ def detect_c2_connections(proc: psutil.Process, c2_host: str, c2_port: int) -> O
     return None
 
 
+def score_process_behavior(proc: psutil.Process, c2_host: str, c2_port: int) -> Optional[Detection]:
+    """Score process behavior instead of relying on one perfect indicator."""
+    score = 0
+    reasons: List[str] = []
+
+    is_ps = is_powershell_process(proc)
+    cmdline = get_cmdline(proc)
+
+    if is_ps:
+        score += 1
+        reasons.append("PowerShell process observed")
+
+    if cmdline:
+        matched_patterns = []
+        for pattern in SUSPICIOUS_POWERSHELL_PATTERNS:
+            if pattern.search(cmdline):
+                matched_patterns.append(pattern.pattern)
+
+        if matched_patterns:
+            score += 3
+            reasons.append(f"suspicious command-line patterns: {', '.join(matched_patterns)}")
+
+    # Network behavior
+    try:
+        conns = proc.net_connections(kind="inet")  # type: ignore[arg-type]
+    except psutil.AccessDenied:
+        try:
+            conns = [c for c in psutil.net_connections(kind="inet") if c.pid == proc.pid]
+        except Exception:
+            conns = []
+    except psutil.NoSuchProcess:
+        return None
+
+    outbound_count = 0
+    c2_matches = []
+
+    for conn in conns:
+        if not conn.raddr:
+            continue
+
+        state = (conn.status or "").upper()
+        if state in {"LISTEN", "CLOSED"}:
+            continue
+
+        r_ip = conn.raddr.ip
+        r_port = conn.raddr.port
+        outbound_count += 1
+
+        if r_port == c2_port and (c2_host == "*" or r_ip == c2_host):
+            c2_matches.append(f"{r_ip}:{r_port}")
+
+    if is_ps and outbound_count > 0:
+        score += 2
+        reasons.append(f"PowerShell has outbound network activity ({outbound_count} connection(s))")
+
+    if is_ps and c2_matches:
+        score += 4
+        reasons.append(f"PowerShell connected to configured C2 target(s): {', '.join(c2_matches)}")
+
+    # Generic PowerShell command line plus network activity is suspicious in your lab.
+    if is_ps and cmdline.lower().endswith("powershell.exe") and outbound_count > 0:
+        score += 2
+        reasons.append("generic PowerShell command line with outbound network behavior")
+
+    if score >= 4:
+        severity = "HIGH" if score >= 6 else "MEDIUM"
+        return Detection(
+            pid=proc.pid,
+            process_name=proc.name(),
+            severity=severity,
+            reason=f"Behavior score {score}: " + "; ".join(reasons),
+            cmdline=cmdline,
+        )
+
+    return None
+
+
 def iter_processes() -> Iterable[psutil.Process]:
     """Safely iterate over processes."""
     for proc in psutil.process_iter(attrs=["pid", "name"]):
@@ -245,6 +322,15 @@ def monitor(
                         print_detection(det2)
                         seen[proc.pid] = cmdline
                     continue
+
+                # 3) Behavior score detection
+                det3 = score_process_behavior(proc, c2_host=host_eff, c2_port=port_eff)
+                if det3:
+                    detection_key = f"{cmdline}|{det3.reason}"
+                    if seen.get(proc.pid) != detection_key:
+                        print_detection(det3)
+                        seen[proc.pid] = detection_key
+                    continue
             
             # Debug output: show PowerShell processes found
             if debug and debug_count % 3 == 0:  # Print every 3rd iteration to reduce spam
@@ -275,7 +361,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_C2_PORT,
         help="C2 port to watch (default: 8080; can also set IT359_C2_PORT env var)",
     )
-    parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds (default: 5.0)")
+    parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds (default: 1.0)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output to see all PowerShell processes")
     parser.add_argument(
         "--no-autodetect-c2",
