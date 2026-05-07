@@ -439,6 +439,36 @@ def count_remote_connections(pid: int) -> Tuple[int, List[str]]:
     return len(remotes_unique), remotes_unique
 
 
+def count_global_external_connections() -> int:
+    """Return count of all external outbound connections on system."""
+
+    try:
+        count = 0
+
+        for c in psutil.net_connections(kind="inet"):
+            if not c.raddr:
+                continue
+
+            ip = getattr(c.raddr, "ip", None) or (
+                c.raddr[0] if isinstance(c.raddr, tuple) else None
+            )
+
+            if not ip:
+                continue
+
+            ip = str(ip).strip()
+
+            # Ignore loopback traffic
+            if ip.startswith("127.") or ip == "::1" or ip.lower() == "localhost":
+                continue
+
+            count += 1
+
+        return count
+
+    except Exception:
+        return 0
+
 def _is_loopback_ip(ip: Optional[str]) -> bool:
     if not ip:
         return False
@@ -891,9 +921,25 @@ def main():
             features["cmdline_high_signal"] = looks_suspicious(proc)
 
             is_ps = is_powershell_family(proc)
+
+            global_external = count_global_external_connections()
+            features["global_external_connections"] = global_external
+
             if is_ps:
-                score+=1
-                reasons.append("PowerShell process detected")
+                powershell_seen_count += 1
+
+                # Lab-friendly correlation:
+                # if PowerShell is running while outbound traffic exists,
+                # treat as suspicious even if socket ownership is unclear.
+                score += 1
+                reasons.append("powershell observed")
+
+                if global_external > 0:
+                    score += 2
+                    reasons.append("powershell active during outbound network traffic")
+
+                features["local_score"] = score
+                features["local_reasons"] = reasons
 
             # Mark "suspicious" for cycle summary. This doesn't mean malicious—it just means
             # it had enough local/network signal to be worth looking at.
