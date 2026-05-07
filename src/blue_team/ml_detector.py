@@ -404,7 +404,7 @@ def count_remote_connections(pid: int) -> Tuple[int, List[str]]:
         for c in psutil.net_connections(kind="inet"):
             if getattr(c, "pid", None) != pid:
                 continue
-            print(f"[debug] pid={pid} conn={c}")
+            
             if not c.raddr:
                 continue
             # On Windows/macOS/Linux: raddr is typically an (ip, port) tuple
