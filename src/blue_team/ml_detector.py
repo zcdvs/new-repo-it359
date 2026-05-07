@@ -206,6 +206,39 @@ def fmt_alert_line(
     )
 
 
+def fmt_ai_block(
+    *,
+    pid: Any,
+    name: Any,
+    score: int,
+    verdict: Optional[str],
+    confidence: Any,
+    reasons: Optional[List[str]],
+    remotes: int,
+    beacon: int,
+    wrap: int,
+) -> str:
+    """Multi-line AI output meant for terminals that truncate long single lines."""
+
+    verdict_s = verdict or "unknown"
+    conf_s = "?" if confidence is None else str(confidence)
+    rs = "; ".join([str(x) for x in (reasons or [])])
+    rs = rs.replace("\r", " ").replace("\n", " ").strip()
+
+    if wrap and wrap > 0:
+        # simple wrapping without importing textwrap for minimal deps
+        chunks = [rs[i : i + wrap] for i in range(0, len(rs), wrap)] or [""]
+        reasons_lines = "\n".join([f"  - {c}" for c in chunks])
+    else:
+        reasons_lines = f"  - {rs}"
+
+    return (
+        "\n"
+        f"[AI] pid={pid} name={name} score={score} remotes={remotes} beacon={beacon} verdict={verdict_s} confidence={conf_s}\n"
+        f"[AI] reasons:\n{reasons_lines}\n"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Process collection and low-cost local heuristics
 # ---------------------------------------------------------------------------
@@ -630,6 +663,18 @@ def main():
     monitor_print_powershell = get_env_bool("ML_DETECTOR_MONITOR_PRINT_POWERSHELL", True)
     monitor_print_netonly = get_env_bool("ML_DETECTOR_MONITOR_PRINT_NETONLY", False)
 
+    # AI output formatting:
+    # - ML_DETECTOR_AI_ONE_LINE=1 prints a single-line AI output.
+    # - ML_DETECTOR_AI_WRAP sets wrap width for reasons in block output (0 disables wrapping).
+    ai_one_line = get_env_bool("ML_DETECTOR_AI_ONE_LINE", False)
+    ai_wrap = int(os.getenv("ML_DETECTOR_AI_WRAP", "120"))
+
+    # Beacon false-positive tuning:
+    # Many background services have periodic network activity; by default we only compute
+    # beacon-likeness for PowerShell-family processes (most relevant to your fileless demo).
+    # Set ML_DETECTOR_BEACON_ONLY_POWERSHELL=0 to enable for all processes.
+    beacon_only_powershell = get_env_bool("ML_DETECTOR_BEACON_ONLY_POWERSHELL", True)
+
     # Avoid hammering the same long-running process with AI.
     # Re-check a (pid, cmdline) at most every N seconds.
     throttle_seconds = cfg.throttle_seconds
@@ -723,7 +768,8 @@ def main():
                 # Otherwise, many long-running services look artificially "periodic" at poll rate.
                 features["beacon_likeness"] = 0
                 features["beacon_reasons"] = []
-                if conn_count > 0 and remotes:
+                allow_beacon_calc = (not beacon_only_powershell) or is_powershell_family(proc)
+                if allow_beacon_calc and conn_count > 0 and remotes:
                     now_ts = time.time()
                     dq = beacon_hist.get(pid_val)
                     if dq is None:
@@ -748,12 +794,19 @@ def main():
                         features["beacon_reasons"] = bl_reasons
 
                         # Beacon-likeness should be a meaningful escalation signal.
-                        if bl_score >= 6:
-                            score += 3
-                            reasons.append("beacon-like timing")
-                        elif bl_score >= 3:
-                            score += 1
-                            reasons.append("possible beacon timing")
+                        if is_powershell_family(proc):
+                            if bl_score >= 6:
+                                score += 3
+                                reasons.append("beacon-like timing")
+                            elif bl_score >= 3:
+                                score += 1
+                                reasons.append("possible beacon timing")
+                        else:
+                            # Non-PS processes are much more likely to be legitimate background updaters.
+                            # Only add suspicion for very strong beacon-likeness.
+                            if bl_score >= 8:
+                                score += 2
+                                reasons.append("strong beacon-like timing")
                         features["local_score"] = score
                         features["local_reasons"] = reasons
 
@@ -853,17 +906,32 @@ def main():
 
             # Step 5: Print only actionable items in quiet mode.
             final_score = int(features.get("local_score") or score)
-            print(
-                fmt_alert_line(
-                    kind="AI",
-                    pid=features.get("pid"),
-                    name=features.get("name"),
-                    score=final_score,
-                    remotes=int(features.get("remote_connection_count") or 0),
-                    beacon=int(features.get("beacon_likeness") or 0),
-                    reasons=[str(x) for x in (model_reasons or [])],
+            if ai_one_line:
+                print(
+                    fmt_alert_line(
+                        kind="AI",
+                        pid=features.get("pid"),
+                        name=features.get("name"),
+                        score=final_score,
+                        remotes=int(features.get("remote_connection_count") or 0),
+                        beacon=int(features.get("beacon_likeness") or 0),
+                        reasons=[str(x) for x in (model_reasons or [])],
+                    )
                 )
-            )
+            else:
+                print(
+                    fmt_ai_block(
+                        pid=features.get("pid"),
+                        name=features.get("name"),
+                        score=final_score,
+                        verdict=verdict,
+                        confidence=confidence,
+                        reasons=model_reasons,
+                        remotes=int(features.get("remote_connection_count") or 0),
+                        beacon=int(features.get("beacon_likeness") or 0),
+                        wrap=ai_wrap,
+                    )
+                )
 
             # Structured alert event. This is the production-friendly output.
             log_event(
