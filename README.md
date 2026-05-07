@@ -117,28 +117,71 @@ Uses ML/AI to identify fileless malware:
 - Python 3.8 or higher
 - Virtual environment recommended
 
+| ML/AI | Google Gemini (via `google-genai`) |
 ### Quick Start
 ```bash
 # Clone the repository
 git clone https://github.com/zcdvs/new-repo-it359.git
 cd new-repo-it359
 
-# Create virtual environment
+# Create a Python virtual environment
 python -m venv venv
-source venv/bin/activate  # macOS/Linux
-# or: .\venv\Scripts\activate  # Windows
+
+# Activate the virtual environment
+# macOS / Linux (bash, zsh)
+source venv/bin/activate
+# Windows (PowerShell)
+.\venv\Scripts\Activate.ps1
+# Windows (cmd.exe)
+.\venv\Scripts\activate.bat
 
 # Install dependencies
 pip install -r requirements.txt
+```
 
-# Set the GEMINI_API_KEY environment variable
-~/.bashrc # Check if you have a configuration file for it
-touch ~/.bashrc # If the previous command resulted in 'No such file or directory'
-open ~/.bashrc
-# Add the following to the file
-# export GEMINI_API_KEY=<YOUR_API_KEY_HERE>
+### Set the GEMINI_API_KEY environment variable
+
+Some optional components use Google Gemini (via the `google-genai` client). Set the `GEMINI_API_KEY` environment variable using one of the methods below (replace `YOUR_API_KEY_HERE` with your key):
+
+PowerShell (temporary current session):
+```powershell
+$env:GEMINI_API_KEY = "YOUR_API_KEY_HERE"
+```
+
+PowerShell (persistent for current user - new sessions required):
+```powershell
+setx GEMINI_API_KEY "YOUR_API_KEY_HERE"
+```
+
+Command Prompt (temporary):
+```cmd
+set GEMINI_API_KEY=YOUR_API_KEY_HERE
+```
+
+Command Prompt (persistent):
+```cmd
+setx GEMINI_API_KEY "YOUR_API_KEY_HERE"
+```
+
+macOS / Linux (temporary):
+```bash
+export GEMINI_API_KEY="YOUR_API_KEY_HERE"
+```
+
+macOS / Linux (persistent):
+```bash
+echo 'export GEMINI_API_KEY="YOUR_API_KEY_HERE"' >> ~/.bashrc
 source ~/.bashrc
 ```
+
+Alternatively, for local development you can create a `.env` file in the repository root containing:
+
+```
+GEMINI_API_KEY=YOUR_API_KEY_HERE
+```
+
+Then load it into your shell or use your preferred dotenv loader when running scripts.
+
 
 ---
 

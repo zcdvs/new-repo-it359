@@ -25,5 +25,3 @@ Fileless malware operates within a computer's RAM rather than writing files to t
 ### Why Study This?
 Modern operating systems have become better at scanning files on disk, causing attackers to pivot to memory-resident techniques that leave no traditional footprint on the filesystem.
 
-## References
-- [Add references here as research progresses]

