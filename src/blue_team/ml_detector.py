@@ -401,8 +401,10 @@ def count_remote_connections(pid: int) -> Tuple[int, List[str]]:
 
     remotes: List[str] = []
     try:
-        p = psutil.Process(pid)
-        for c in p.net_connections(kind="inet"):
+        for c in psutil.net_connections(kind="inet"):
+            if getattr(c, "pid", None) != pid:
+                continue
+            print(f"[debug] pid={pid} conn={c}")
             if not c.raddr:
                 continue
             # On Windows/macOS/Linux: raddr is typically an (ip, port) tuple
@@ -890,7 +892,8 @@ def main():
 
             is_ps = is_powershell_family(proc)
             if is_ps:
-                powershell_seen_count += 1
+                score+=1
+                reasons.append("PowerShell process detected")
 
             # Mark "suspicious" for cycle summary. This doesn't mean malicious—it just means
             # it had enough local/network signal to be worth looking at.
