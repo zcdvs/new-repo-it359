@@ -37,15 +37,10 @@ client = genai.Client()
 @dataclass(frozen=True)
 class DetectorConfig:
     poll_seconds: float
-    scan_mode: str
     debug: bool
-    output_mode: str
-    cycle_summary_every: int
-    alert_score_threshold: int
     min_score_for_ai: int
     max_ai_per_cycle: int
     throttle_seconds: float
-    net_boost_powershell_only: bool
     write_alert_log: bool
     alert_log_path: str
     ai_verbose: bool
@@ -74,18 +69,13 @@ def _compile_regex_list(raw: str) -> List[re.Pattern[str]]:
 
 
 def get_config() -> DetectorConfig:
-    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "5"))
-    scan_mode = os.getenv("ML_DETECTOR_SCAN_MODE", "all").strip().lower()
+    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "10"))
     debug = get_env_bool("ML_DETECTOR_DEBUG", False)
 
-    output_mode = os.getenv("ML_DETECTOR_OUTPUT_MODE", "quiet").strip().lower()
-    cycle_summary_every = int(os.getenv("ML_DETECTOR_CYCLE_SUMMARY_EVERY", "6"))
-    alert_score_threshold = int(os.getenv("ML_DETECTOR_ALERT_SCORE_THRESHOLD", "4"))
-    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "2"))
-    max_ai_per_cycle = int(os.getenv("ML_DETECTOR_MAX_AI_PER_CYCLE", "3"))
-
-    throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "60"))
-    net_boost_powershell_only = get_env_bool("ML_DETECTOR_NET_BOOST_POWERSHELL_ONLY", True)
+    # Always-on monitor: we still use a local score to decide when to call the model.
+    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "3"))
+    max_ai_per_cycle = int(os.getenv("ML_DETECTOR_MAX_AI_PER_CYCLE", "4"))
+    throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "30"))
 
     ai_verbose = get_env_bool("ML_DETECTOR_AI_VERBOSE", False)
     ai_print_pid_expl = get_env_bool("ML_DETECTOR_AI_PRINT_PID_EXPLANATION", False)
@@ -102,15 +92,10 @@ def get_config() -> DetectorConfig:
 
     return DetectorConfig(
         poll_seconds=poll_seconds,
-        scan_mode=scan_mode,
         debug=debug,
-        output_mode=output_mode,
-        cycle_summary_every=cycle_summary_every,
-        alert_score_threshold=alert_score_threshold,
         min_score_for_ai=min_score_for_ai,
-        max_ai_per_cycle=max_ai_per_cycle,
-        throttle_seconds=throttle_seconds,
-        net_boost_powershell_only=net_boost_powershell_only,
+    max_ai_per_cycle=max_ai_per_cycle,
+    throttle_seconds=throttle_seconds,
         write_alert_log=write_alert_log,
         alert_log_path=alert_log_path,
         ai_verbose=ai_verbose,
@@ -293,47 +278,6 @@ def is_powershell_family(proc: Dict[str, Any]) -> bool:
     return "powershell" in name or "pwsh" in name
 
 
-def maybe_read_powershell_history_lines(max_lines: int = 200) -> List[str]:
-    """Best-effort read of PowerShell PSReadLine history (Windows).
-
-    This is OPTIONAL and intended for lab demos when the cmdline doesn't include
-    the actual interactive commands (e.g., user types `iex ...` inside a shell).
-
-    Controlled by env var:
-      ML_DETECTOR_READ_PS_HISTORY=1
-
-    Returns:
-      A list of recent history lines (lowercased, stripped). On failure returns [].
-    """
-
-    if os.name != "nt":
-        return []
-
-    if os.getenv("ML_DETECTOR_READ_PS_HISTORY", "0").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "y",
-        "on",
-    }:
-        return []
-
-    appdata = os.getenv("APPDATA") or ""
-    if not appdata:
-        return []
-
-    # Typical path: %APPDATA%\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt
-    hist_path = os.path.join(
-        appdata, "Microsoft", "Windows", "PowerShell", "PSReadLine", "ConsoleHost_history.txt"
-    )
-    try:
-        with open(hist_path, "r", encoding="utf-8", errors="ignore") as f:
-            lines = [ln.strip().lower() for ln in f.read().splitlines() if ln.strip()]
-        return lines[-max_lines:]
-    except Exception:
-        return []
-
-
 def get_env_bool(name: str, default: bool) -> bool:
     """Parse environment variable booleans like 1/0, true/false, yes/no."""
     raw = os.getenv(name)
@@ -374,15 +318,6 @@ def local_risk_score(proc: Dict[str, Any]) -> Tuple[int, List[str]]:
         (r"(?<![a-zA-Z0-9])file:(?![a-zA-Z0-9])", 4, "file URI"),
         (r"(?<![a-zA-Z0-9])http(?![a-zA-Z0-9])", 2, "HTTP in cmdline"),
         (r"(?<![a-zA-Z0-9])invoke-webrequest(?![a-zA-Z0-9])", 3, "Invoke-WebRequest"),
-        # If the script is launched with -File, the cmdline may not show IEX/etc.
-        # Catch our lab simulation script/file name as a high-signal indicator.
-        (r"fileless_simulation\.ps1", 6, "fileless simulation script"),
-        # Catch key function names from the simulation even if invoked indirectly.
-        (
-            r"\b(send-beacon|invoke-memoryexecution|get-systemrecon|show-registrypersistence)\b",
-            4,
-            "matches simulation technique name",
-        ),
     ]
 
     for pattern, pts, label in indicators:
@@ -620,7 +555,7 @@ def main():
         print(f"[warn] AI init failed ({type(e).__name__}): {e}")
         print("[warn] Continuing; AI classifications may fail until configured.")
     print("----------------------------------------------------------------")
-    print("Monitoring running processes. Press Ctrl+C to stop.")
+    print("Monitoring running processes (start this BEFORE running the fileless simulation). Ctrl+C to stop.")
 
     # Structured startup log for ops.
     log_event(
@@ -633,36 +568,21 @@ def main():
             "python": platform.python_version(),
             "config": {
                 "poll_seconds": cfg.poll_seconds,
-                "scan_mode": cfg.scan_mode,
-                "output_mode": cfg.output_mode,
                 "min_score_for_ai": cfg.min_score_for_ai,
                 "max_ai_per_cycle": cfg.max_ai_per_cycle,
                 "throttle_seconds": cfg.throttle_seconds,
-                "net_boost_powershell_only": cfg.net_boost_powershell_only,
                 "json_log_path": cfg.json_log_path,
             },
         },
     )
 
-    # Tuning knobs (environment variables)
-    # - ML_DETECTOR_POLL_SECONDS: polling interval
-    # - ML_DETECTOR_MIN_SCORE: minimum local heuristic score before AI
-    # - ML_DETECTOR_SCAN_MODE: "new" (default) or "all"
-    #       new: only processes first observed after the detector starts
-    #       all: re-check running processes each poll (with throttle)
-    # - ML_DETECTOR_DEBUG: print why items are/aren't escalated
+    # Always-on behavior:
+    # - we monitor continuously
+    # - we call AI only for suspicious processes (local score or beacon-likeness)
     poll_seconds = cfg.poll_seconds
     min_score_for_ai = cfg.min_score_for_ai
     max_ai_per_cycle = cfg.max_ai_per_cycle
-
-    # For LiveMode beaconing, "all" is usually the right default because
-    # the PowerShell host process may already exist before the detector starts.
-    scan_mode = cfg.scan_mode
     debug = cfg.debug
-    output_mode = cfg.output_mode
-    show_scores = output_mode == "monitor"
-    cycle_summary_every = cfg.cycle_summary_every
-    alert_score_threshold = cfg.alert_score_threshold
 
     # Output controls:
     # - ML_DETECTOR_AI_VERBOSE=1 -> print full features + raw model output
@@ -674,17 +594,10 @@ def main():
     write_alert_log = cfg.write_alert_log
     alert_log_path = cfg.alert_log_path
 
-    # Reduce noise: by default only treat outbound network connections as a strong
-    # signal for PowerShell-family processes (common for fileless toolchains).
-    net_boost_powershell_only = cfg.net_boost_powershell_only
-
-    # In "all" mode, avoid hammering the same long-running process.
+    # Avoid hammering the same long-running process with AI.
     # Re-check a (pid, cmdline) at most every N seconds.
     throttle_seconds = cfg.throttle_seconds
     last_checked: Dict[Tuple[int, int], float] = {}
-
-    # Tracking set used to detect *new* processes between polls.
-    known_pids: set[int] = set()
 
     # Per-PID time series used for beacon-likeness scoring.
     # Stores only recent samples to keep memory bounded.
@@ -708,33 +621,13 @@ def main():
     cycle_no = 0
     while True:
         cycle_no += 1
-        ps_history_lines = maybe_read_powershell_history_lines()
-        ps_hist_hit = any(
-            any(ind in f" {ln} " for ind in ps_hist_indicators) for ln in ps_history_lines
-        )
         snapshot = iter_processes()
+        procs = [p for p in snapshot if isinstance(p.get("pid"), int)]
 
-        # Per-cycle counters (for a concise "is it working?" summary)
         scanned_count = 0
-        nonzero_score_count = 0
         escalated_to_ai_count = 0
         powershell_seen_count = 0
 
-        # Choose candidates depending on scan mode.
-        # - new: only look at newly observed PIDs
-        # - all: look at all running processes each poll (throttled)
-        if scan_mode == "all":
-            procs = [p for p in snapshot if isinstance(p.get("pid"), int)]
-        else:
-            procs = [
-                p
-                for p in snapshot
-                if isinstance(p.get("pid"), int) and p["pid"] not in known_pids
-            ]
-            for p in procs:
-                known_pids.add(p["pid"])
-
-    # Step 1: iterate candidates
         for proc in procs:
             scanned_count += 1
 
@@ -763,19 +656,6 @@ def main():
             features["local_score"] = score
             features["local_reasons"] = reasons
 
-            # If enabled and we saw suspicious interactive history, boost PowerShell-family processes.
-            if ps_hist_hit and is_powershell_family(proc):
-                score += 3
-                reasons.append("suspicious PowerShell history (interactive)")
-                features["local_score"] = score
-                features["local_reasons"] = reasons
-                features["ps_history_signal"] = True
-            else:
-                features["ps_history_signal"] = False
-
-            if score > 0:
-                nonzero_score_count += 1
-
             # LiveMode behavior signal: outbound connections.
             pid_val = features.get("pid")
             conn_count = 0
@@ -786,13 +666,15 @@ def main():
                     conn_count, remotes = count_remote_connections(pid_val)
                 except Exception:
                     conn_count, remotes = 0, []
-                is_ps_for_net = is_powershell_family(proc)
-                net_boost_allowed = (not net_boost_powershell_only) or is_ps_for_net
 
-                # Only treat outbound networking as a *strong* signal for PowerShell by default.
-                if conn_count > 0 and net_boost_allowed:
-                    score += 3
-                    reasons.append("PowerShell outbound network activity")
+                # Treat outbound networking as *some* signal, and stronger when PowerShell is involved.
+                is_ps_for_net = is_powershell_family(proc)
+                if conn_count > 0:
+                    score += 1
+                    reasons.append("outbound network activity")
+                    if is_ps_for_net:
+                        score += 2
+                        reasons.append("PowerShell outbound network activity")
                     features["local_score"] = score
                     features["local_reasons"] = reasons
 
@@ -800,42 +682,37 @@ def main():
                 # We score based on periodic connection behavior for processes
                 # that exhibit outbound network activity.
                 now_ts = time.time()
-                if net_boost_allowed:
-                    dq = beacon_hist.get(pid_val)
-                    if dq is None:
-                        dq = deque(maxlen=200)
-                        beacon_hist[pid_val] = dq
-                    dq.append((now_ts, int(conn_count), list(remotes)))
+                dq = beacon_hist.get(pid_val)
+                if dq is None:
+                    dq = deque(maxlen=200)
+                    beacon_hist[pid_val] = dq
+                dq.append((now_ts, int(conn_count), list(remotes)))
 
-                # Evict old samples outside the window.
-                    cutoff = now_ts - beacon_history_seconds
-                    while dq and dq[0][0] < cutoff:
-                        dq.popleft()
+                cutoff = now_ts - beacon_history_seconds
+                while dq and dq[0][0] < cutoff:
+                    dq.popleft()
 
-                    if len(dq) >= beacon_min_samples:
-                        ts = [x[0] for x in dq]
-                        counts = [x[1] for x in dq]
-                        rem_series = [x[2] for x in dq]
-                        bl_score, bl_reasons = compute_beacon_likeness(
-                            timestamps=ts,
-                            remote_counts=counts,
-                            remote_endpoints=rem_series,
-                        )
-                        features["beacon_likeness"] = bl_score
-                        features["beacon_reasons"] = bl_reasons
-                        # Beacon-likeness is supplemental: it should not dominate.
-                        # Only add a small boost so cmdline/script indicators remain primary.
-                        if bl_score >= 6:
-                            score += 1
-                            reasons.append("beacon-like timing (supplemental)")
-                        elif bl_score >= 3:
-                            score += 1
-                            reasons.append("possible beacon timing (supplemental)")
-                        features["local_score"] = score
-                        features["local_reasons"] = reasons
-                    else:
-                        features["beacon_likeness"] = 0
-                        features["beacon_reasons"] = []
+                if len(dq) >= beacon_min_samples:
+                    ts = [x[0] for x in dq]
+                    counts = [x[1] for x in dq]
+                    rem_series = [x[2] for x in dq]
+                    bl_score, bl_reasons = compute_beacon_likeness(
+                        timestamps=ts,
+                        remote_counts=counts,
+                        remote_endpoints=rem_series,
+                    )
+                    features["beacon_likeness"] = bl_score
+                    features["beacon_reasons"] = bl_reasons
+
+                    # Beacon-likeness should be a meaningful escalation signal.
+                    if bl_score >= 6:
+                        score += 3
+                        reasons.append("beacon-like timing")
+                    elif bl_score >= 3:
+                        score += 1
+                        reasons.append("possible beacon timing")
+                    features["local_score"] = score
+                    features["local_reasons"] = reasons
                 else:
                     features["beacon_likeness"] = 0
                     features["beacon_reasons"] = []
@@ -851,18 +728,16 @@ def main():
             if is_ps:
                 powershell_seen_count += 1
 
-            if show_scores:
-                # Reduce noise: only print per-process lines when there's any local signal.
-                # Also print PowerShell-family processes so demos are easier to follow.
-                if score > 0 or is_ps:
-                    cmd_part = ""
-                    if monitor_print_cmdline:
-                        cmd_part = f" cmdline={trunc(str(features.get('cmdline') or ''), 120)}"
-                    print(
-                        f"[monitor] pid={features.get('pid')} name={features.get('name')} "
-                        f"score={features.get('local_score')} reasons={features.get('local_reasons')} "
-                        f"remotes={features.get('remote_connection_count', 0)}" + cmd_part
-                    )
+            # Always show suspicious things (keeps it simple for demos).
+            if score > 0 or is_ps:
+                cmd_part = ""
+                if monitor_print_cmdline:
+                    cmd_part = f" cmdline={trunc(str(features.get('cmdline') or ''), 120)}"
+                print(
+                    f"[monitor] pid={features.get('pid')} name={features.get('name')} "
+                    f"score={features.get('local_score')} remotes={features.get('remote_connection_count', 0)} "
+                    f"beacon={features.get('beacon_likeness', 0)} reasons={features.get('local_reasons')}" + cmd_part
+                )
 
             # Additional throttle for scan_mode=all
             pid = features.get("pid")
@@ -871,7 +746,7 @@ def main():
             throttle_key = (pid_i, cmd_hash2)
             now = time.time()
             last = last_checked.get(throttle_key)
-            if scan_mode == "all" and last is not None and (now - last) < throttle_seconds:
+            if last is not None and (now - last) < throttle_seconds:
                 if debug:
                     print(
                         f"[debug] throttled pid={pid_i} ({int(now - last)}s since last check)"
@@ -910,18 +785,17 @@ def main():
 
             # Step 5: Print only actionable items in quiet mode.
             final_score = int(features.get("local_score") or score)
-            if output_mode == "monitor" or final_score >= alert_score_threshold or verdict in {"suspicious", "malicious"}:
-                print(
-                    fmt_ai_summary(
-                        pid=features.get("pid"),
-                        name=features.get("name"),
-                        score=final_score,
-                        verdict=verdict,
-                        confidence=confidence,
-                        reasons=model_reasons,
-                        conn_count=int(features.get("remote_connection_count") or 0),
-                    )
+            print(
+                fmt_ai_summary(
+                    pid=features.get("pid"),
+                    name=features.get("name"),
+                    score=final_score,
+                    verdict=verdict,
+                    confidence=confidence,
+                    reasons=model_reasons,
+                    conn_count=int(features.get("remote_connection_count") or 0),
                 )
+            )
 
             # Structured alert event. This is the production-friendly output.
             log_event(
@@ -970,24 +844,20 @@ def main():
                     if debug:
                         print(f"[debug] failed writing alert log ({type(e).__name__}): {e}")
 
-        # Cycle summary (quiet mode): periodic single line so you know it’s alive.
-        if (not show_scores) and cycle_summary_every > 0 and (cycle_no % cycle_summary_every == 0):
-            print(
-                f"[cycle] scanned={scanned_count} ps_seen={powershell_seen_count} "
-                f"scored={nonzero_score_count} ai={escalated_to_ai_count}"
-            )
-
-            log_event(
-                logger,
-                {
-                    "event": "cycle_summary",
-                    "ts": time.time(),
-                    "scanned": scanned_count,
-                    "ps_seen": powershell_seen_count,
-                    "scored": nonzero_score_count,
-                    "ai": escalated_to_ai_count,
-                },
-            )
+        # Cycle summary: one line per cycle so you can see it's alive.
+        print(
+            f"[cycle] scanned={scanned_count} ps_seen={powershell_seen_count} ai={escalated_to_ai_count}"
+        )
+        log_event(
+            logger,
+            {
+                "event": "cycle_summary",
+                "ts": time.time(),
+                "scanned": scanned_count,
+                "ps_seen": powershell_seen_count,
+                "ai": escalated_to_ai_count,
+            },
+        )
 
         time.sleep(poll_seconds)
 
