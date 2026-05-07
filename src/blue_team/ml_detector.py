@@ -191,7 +191,6 @@ def fmt_alert_line(
     name: Any,
     score: int,
     remotes: int,
-    loopback: int = 0,
     beacon: int,
     reasons: List[str],
     cmdline: str = "",
@@ -201,9 +200,8 @@ def fmt_alert_line(
     """Single-line console output to keep output readable."""
     rs = ",".join([trunc(str(r), 60) for r in (reasons or [])[:max_reasons]])
     cmd_part = f" cmd={trunc(cmdline, max_cmd)}" if cmdline else ""
-    loop_part = f" loop={loopback}" if loopback else ""
     return (
-        f"[{kind}] pid={pid} name={name} score={score} remotes={remotes}{loop_part} "
+        f"[{kind}] pid={pid} name={name} score={score} remotes={remotes} "
         f"beacon={beacon} reasons={rs}{cmd_part}"
     )
 
@@ -217,7 +215,6 @@ def fmt_ai_block(
     confidence: Any,
     reasons: Optional[List[str]],
     remotes: int,
-    loopback: int = 0,
     beacon: int,
     wrap: int,
 ) -> str:
@@ -235,10 +232,9 @@ def fmt_ai_block(
     else:
         reasons_lines = f"  - {rs}"
 
-    loop_part = f" loop={loopback}" if loopback else ""
     return (
         "\n"
-        f"[AI] pid={pid} name={name} score={score} remotes={remotes}{loop_part} beacon={beacon} verdict={verdict_s} confidence={conf_s}\n"
+        f"[AI] pid={pid} name={name} score={score} remotes={remotes} beacon={beacon} verdict={verdict_s} confidence={conf_s}\n"
         f"[AI] reasons:\n{reasons_lines}\n"
     )
 
@@ -269,7 +265,7 @@ def iter_processes() -> List[Dict[str, Any]]:
     procs: List[Dict[str, Any]] = []
 
     for p in psutil.process_iter(
-        attrs=["pid", "name", "username", "cmdline", "create_time"],
+        attrs=["pid", "name", "username", "cmdline", "create_time", "exe"],
         ad_value=None,
     ):
         info = p.info
@@ -287,6 +283,7 @@ def iter_processes() -> List[Dict[str, Any]]:
                 "user": info.get("username") or "",
                 "host": host,
                 "create_time": info.get("create_time"),
+                "exe": info.get("exe") or "",
             }
         )
 
@@ -492,6 +489,11 @@ def compute_beacon_likeness(
     if len(timestamps) < 3:
         return 0, reasons
 
+    # Avoid overreacting to very small sample windows.
+    span = float(max(timestamps) - min(timestamps)) if timestamps else 0.0
+    if span < float(os.getenv("ML_DETECTOR_BEACON_MIN_WINDOW_SECONDS", "30")):
+        return 0, reasons
+
     mean_i, jitter = _interval_stats(timestamps)
     score = 0
 
@@ -500,10 +502,12 @@ def compute_beacon_likeness(
         # Relative jitter (lower is "more periodic")
         rel = jitter / mean_i
         # Typical beacon intervals are often 2s+; still allow small loops for demos.
-        if mean_i >= 2 and rel <= 0.35:
+    # Tight periodicity is a strong signal, but real systems often show *some* jitter.
+    # Keep this conservative to avoid flagging telemetry/updaters.
+    if mean_i >= 2 and rel <= 0.20:
             score += 5
             reasons.append(f"periodic callbacks (avg={mean_i:.1f}s jitter={rel:.2f})")
-        elif mean_i >= 2 and rel <= 0.6:
+    elif mean_i >= 2 and rel <= 0.45:
             score += 3
             reasons.append(f"semi-periodic callbacks (avg={mean_i:.1f}s jitter={rel:.2f})")
 
@@ -734,7 +738,8 @@ def main():
     # Per-PID time series used for beacon-likeness scoring.
     # Stores only recent samples to keep memory bounded.
     beacon_history_seconds = float(os.getenv("ML_DETECTOR_BEACON_WINDOW_SECONDS", "120"))
-    beacon_min_samples = int(os.getenv("ML_DETECTOR_BEACON_MIN_SAMPLES", "4"))
+    # Require more samples by default to reduce false positives from short observation windows.
+    beacon_min_samples = int(os.getenv("ML_DETECTOR_BEACON_MIN_SAMPLES", "6"))
     # pid -> deque of (timestamp, conn_count, remotes)
     beacon_hist: Dict[int, Deque[Tuple[float, int, List[str]]]] = {}
 
@@ -779,6 +784,7 @@ def main():
                 "user": proc.get("user"),
                 "host": proc.get("host"),
                 "create_time": proc.get("create_time"),
+                "exe": proc.get("exe"),
             }
 
             # Always include stable environment fields for downstream correlation.
@@ -911,7 +917,6 @@ def main():
                             name=features.get("name"),
                             score=int(features.get("local_score") or 0),
                             remotes=int(features.get("external_connection_count") or 0),
-                            loopback=len(list(features.get("loopback_endpoints") or [])),
                             beacon=int(features.get("beacon_likeness") or 0),
                             reasons=[str(x) for x in (features.get("local_reasons") or [])],
                             cmdline=cmdline,
@@ -958,6 +963,33 @@ def main():
                         f"score={score} threshold={ai_threshold} reasons={reasons} cmdline_high_signal={features.get('cmdline_high_signal')}"
                     )
                 continue
+
+            # Extra safety: core Windows processes are noisy and commonly talk to the network indirectly.
+            # Require stronger local signal before escalating them to AI.
+            core_proc_names = {
+                x.strip().lower()
+                for x in _split_csv(
+                    os.getenv(
+                        "ML_DETECTOR_CORE_PROCESS_NAMES",
+                        "explorer.exe,mpdefendercoreservice.exe,svchost.exe,system,lsass.exe,services.exe,wininit.exe"
+                    )
+                )
+                if x.strip()
+            }
+            if proc_name_l in core_proc_names and not is_ps:
+                # Only allow if we have a high beacon score AND at least one external endpoint,
+                # or if the local heuristic score is meaningfully higher than the default threshold.
+                strong_core_min = int(os.getenv("ML_DETECTOR_CORE_MIN_SCORE", "6"))
+                if int(features.get("external_connection_count") or 0) <= 0:
+                    if debug:
+                        print(f"[debug] core-skip (no external) pid={features.get('pid')} name={features.get('name')}")
+                    continue
+                if int(features.get("beacon_likeness") or 0) < int(os.getenv("ML_DETECTOR_CORE_MIN_BEACON", "9")) and score < strong_core_min:
+                    if debug:
+                        print(
+                            f"[debug] core-skip pid={features.get('pid')} name={features.get('name')} score={score} beacon={int(features.get('beacon_likeness') or 0)}"
+                        )
+                    continue
 
             # Additional guardrail: suppress AI escalation for common noisy processes
             # unless there's external network activity or a stronger local score.
@@ -1012,7 +1044,6 @@ def main():
                         name=features.get("name"),
                         score=final_score,
                         remotes=int(features.get("external_connection_count") or 0),
-                        loopback=len(list(features.get("loopback_endpoints") or [])),
                         beacon=int(features.get("beacon_likeness") or 0),
                         reasons=[str(x) for x in (model_reasons or [])],
                     )
@@ -1027,7 +1058,6 @@ def main():
                         confidence=confidence,
                         reasons=model_reasons,
                         remotes=int(features.get("external_connection_count") or 0),
-                        loopback=len(list(features.get("loopback_endpoints") or [])),
                         beacon=int(features.get("beacon_likeness") or 0),
                         wrap=ai_wrap,
                     )
@@ -1047,6 +1077,7 @@ def main():
                     "local_reasons": features.get("local_reasons"),
                     "model_reasons": model_reasons,
                     "remote_connection_count": int(features.get("remote_connection_count") or 0),
+                    "external_connection_count": int(features.get("external_connection_count") or 0),
                     "beacon_likeness": int(features.get("beacon_likeness") or 0),
                 },
             )
