@@ -184,6 +184,28 @@ def fmt_ai_summary(
     )
 
 
+def fmt_alert_line(
+    *,
+    kind: str,
+    pid: Any,
+    name: Any,
+    score: int,
+    remotes: int,
+    beacon: int,
+    reasons: List[str],
+    cmdline: str = "",
+    max_reasons: int = 3,
+    max_cmd: int = 120,
+) -> str:
+    """Single-line console output to keep output readable."""
+    rs = ",".join([trunc(str(r), 60) for r in (reasons or [])[:max_reasons]])
+    cmd_part = f" cmd={trunc(cmdline, max_cmd)}" if cmdline else ""
+    return (
+        f"[{kind}] pid={pid} name={name} score={score} remotes={remotes} "
+        f"beacon={beacon} reasons={rs}{cmd_part}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Process collection and low-cost local heuristics
 # ---------------------------------------------------------------------------
@@ -598,6 +620,16 @@ def main():
     write_alert_log = cfg.write_alert_log
     alert_log_path = cfg.alert_log_path
 
+    # Console output tuning (defaults chosen to reduce benign noise):
+    # - ML_DETECTOR_PRINT_MONITOR=1 enables per-process monitor lines.
+    # - ML_DETECTOR_MONITOR_MIN_SCORE sets minimum local score to print.
+    # - ML_DETECTOR_MONITOR_PRINT_POWERSHELL=1 prints PowerShell even at low score.
+    # - ML_DETECTOR_MONITOR_PRINT_NETONLY=1 prints any process with conn_count>0 even if score is low.
+    print_monitor = get_env_bool("ML_DETECTOR_PRINT_MONITOR", False)
+    monitor_min_score = int(os.getenv("ML_DETECTOR_MONITOR_MIN_SCORE", "2"))
+    monitor_print_powershell = get_env_bool("ML_DETECTOR_MONITOR_PRINT_POWERSHELL", True)
+    monitor_print_netonly = get_env_bool("ML_DETECTOR_MONITOR_PRINT_NETONLY", False)
+
     # Avoid hammering the same long-running process with AI.
     # Re-check a (pid, cmdline) at most every N seconds.
     throttle_seconds = cfg.throttle_seconds
@@ -631,6 +663,8 @@ def main():
         scanned_count = 0
         escalated_to_ai_count = 0
         powershell_seen_count = 0
+        monitor_printed_count = 0
+        suspicious_count = 0
 
         for proc in procs:
             scanned_count += 1
@@ -734,16 +768,36 @@ def main():
             if is_ps:
                 powershell_seen_count += 1
 
-            # Always show suspicious things (keeps it simple for demos).
-            if score > 0 or is_ps:
-                cmd_part = ""
-                if monitor_print_cmdline:
-                    cmd_part = f" cmdline={trunc(str(features.get('cmdline') or ''), 120)}"
-                print(
-                    f"[monitor] pid={features.get('pid')} name={features.get('name')} "
-                    f"score={features.get('local_score')} remotes={features.get('remote_connection_count', 0)} "
-                    f"beacon={features.get('beacon_likeness', 0)} reasons={features.get('local_reasons')}" + cmd_part
-                )
+            # Mark "suspicious" for cycle summary. This doesn't mean malicious—it just means
+            # it had enough local/network signal to be worth looking at.
+            if score >= monitor_min_score or int(features.get("beacon_likeness") or 0) >= 3:
+                suspicious_count += 1
+
+            # Optional per-process monitor lines (off by default to reduce benign noise).
+            if print_monitor:
+                should_print = False
+                if score >= monitor_min_score:
+                    should_print = True
+                if monitor_print_powershell and is_ps:
+                    should_print = True
+                if monitor_print_netonly and int(features.get("remote_connection_count") or 0) > 0:
+                    should_print = True
+
+                if should_print:
+                    monitor_printed_count += 1
+                    cmdline = str(features.get("cmdline") or "") if monitor_print_cmdline else ""
+                    print(
+                        fmt_alert_line(
+                            kind="MON",
+                            pid=features.get("pid"),
+                            name=features.get("name"),
+                            score=int(features.get("local_score") or 0),
+                            remotes=int(features.get("remote_connection_count") or 0),
+                            beacon=int(features.get("beacon_likeness") or 0),
+                            reasons=[str(x) for x in (features.get("local_reasons") or [])],
+                            cmdline=cmdline,
+                        )
+                    )
 
             # Additional throttle for scan_mode=all
             pid = features.get("pid")
@@ -800,14 +854,14 @@ def main():
             # Step 5: Print only actionable items in quiet mode.
             final_score = int(features.get("local_score") or score)
             print(
-                fmt_ai_summary(
+                fmt_alert_line(
+                    kind="AI",
                     pid=features.get("pid"),
                     name=features.get("name"),
                     score=final_score,
-                    verdict=verdict,
-                    confidence=confidence,
-                    reasons=model_reasons,
-                    conn_count=int(features.get("remote_connection_count") or 0),
+                    remotes=int(features.get("remote_connection_count") or 0),
+                    beacon=int(features.get("beacon_likeness") or 0),
+                    reasons=[str(x) for x in (model_reasons or [])],
                 )
             )
 
@@ -860,7 +914,8 @@ def main():
 
         # Cycle summary: one line per cycle so you can see it's alive.
         print(
-            f"[cycle] scanned={scanned_count} ps_seen={powershell_seen_count} ai={escalated_to_ai_count}"
+            f"[cycle] scanned={scanned_count} ps_seen={powershell_seen_count} "
+            f"susp={suspicious_count} mon={monitor_printed_count} ai={escalated_to_ai_count}"
         )
         log_event(
             logger,
