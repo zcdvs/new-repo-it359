@@ -140,7 +140,6 @@ def detect_c2_connections(proc: psutil.Process, c2_host: str, c2_port: int) -> O
         if not conn.raddr:
             continue
 
-        # Skip listeners/closed sockets; keep established-ish outbound states.
         state = (conn.status or "").upper()
         if state and state in {"LISTEN", "CLOSED"}:
             continue
