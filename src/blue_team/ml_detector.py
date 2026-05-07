@@ -976,6 +976,8 @@ def main():
                 )
                 if x.strip()
             }
+            proc_name_l = (str(features.get("name") or "")).lower()
+            
             if proc_name_l in core_proc_names and not is_ps:
                 # Only allow if we have a high beacon score AND at least one external endpoint,
                 # or if the local heuristic score is meaningfully higher than the default threshold.
@@ -993,7 +995,6 @@ def main():
 
             # Additional guardrail: suppress AI escalation for common noisy processes
             # unless there's external network activity or a stronger local score.
-            proc_name_l = (str(features.get("name") or "")).lower()
             if proc_name_l in suppress_ai_process_names:
                 has_external = int(features.get("external_connection_count") or 0) > 0
                 if (not suppress_ai_requires_external) or has_external:
