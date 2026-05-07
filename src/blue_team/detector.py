@@ -24,7 +24,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Set
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import psutil
 
@@ -34,9 +34,12 @@ try:
 except Exception:
     winreg = None
 
-# Default values should match the C2 listener defaults
-DEFAULT_C2_HOST = "127.0.0.1"
-DEFAULT_C2_PORT = 8080
+# Default values should match the C2 listener defaults.
+# NOTE: In the recommended lab topology the C2 listener runs on a separate VM.
+# For that reason, default host is '*' (any IP on the chosen port) rather than
+# localhost, which would only detect a C2 running on the same machine.
+DEFAULT_C2_HOST = os.getenv("IT359_C2_HOST", "*")
+DEFAULT_C2_PORT = int(os.getenv("IT359_C2_PORT", "8080"))
 
 
 SUSPICIOUS_POWERSHELL_PATTERNS: List[re.Pattern[str]] = [
@@ -49,6 +52,30 @@ SUSPICIOUS_POWERSHELL_PATTERNS: List[re.Pattern[str]] = [
 ]
 
 POWERSHELL_NAMES: Set[str] = {"powershell.exe", "powershell", "pwsh.exe", "pwsh"}
+
+
+def parse_c2_from_cmdline(cmdline: str) -> Tuple[Optional[str], Optional[int]]:
+    """Best-effort extraction of -C2Server/-C2Port from the simulation command line."""
+
+    if not cmdline:
+        return None, None
+
+    host: Optional[str] = None
+    port: Optional[int] = None
+
+    # Accept: -C2Server 1.2.3.4 or -C2Server "1.2.3.4"
+    m_host = re.search(r"-C2Server\s+\"?([^\"\s]+)\"?", cmdline, re.IGNORECASE)
+    if m_host:
+        host = m_host.group(1).strip()
+
+    m_port = re.search(r"-C2Port\s+(\d+)", cmdline, re.IGNORECASE)
+    if m_port:
+        try:
+            port = int(m_port.group(1))
+        except ValueError:
+            port = None
+
+    return host, port
 
 
 @dataclass
@@ -105,14 +132,28 @@ def detect_c2_connections(proc: psutil.Process, c2_host: str, c2_port: int) -> O
     """Detect if the process is connecting to the configured C2 host/port."""
     try:
         conns = proc.net_connections(kind="inet")  # type: ignore[arg-type]
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
+    except psutil.NoSuchProcess:
         return None
+    except psutil.AccessDenied:
+        # Common on Windows without elevated privileges.
+        # Fallback: scan system-wide connections and filter by PID.
+        try:
+            conns = [c for c in psutil.net_connections(kind="inet") if c.pid == proc.pid]
+        except Exception:
+            return None
 
     cmdline = get_cmdline(proc)
+
     for conn in conns:
         if not conn.raddr:
             continue
+
+        state = (conn.status or "").upper()
+        if state and state in {"LISTEN", "CLOSED"}:
+            continue
+
         r_ip, r_port = conn.raddr.ip, conn.raddr.port
+
         if r_port == c2_port and (c2_host == "*" or r_ip == c2_host):
             severity = "HIGH" if is_powershell_process(proc) else "MEDIUM"
             return Detection(
@@ -254,6 +295,81 @@ def detect_artifact_files(seen: Dict[str, str]) -> None:
         except Exception:
             continue
 
+def score_process_behavior(proc: psutil.Process, c2_host: str, c2_port: int) -> Optional[Detection]:
+    """Score process behavior instead of relying on one perfect indicator."""
+    score = 0
+    reasons: List[str] = []
+
+    is_ps = is_powershell_process(proc)
+    cmdline = get_cmdline(proc)
+
+    if is_ps:
+        score += 1
+        reasons.append("PowerShell process observed")
+
+    if cmdline:
+        matched_patterns = []
+        for pattern in SUSPICIOUS_POWERSHELL_PATTERNS:
+            if pattern.search(cmdline):
+                matched_patterns.append(pattern.pattern)
+
+        if matched_patterns:
+            score += 3
+            reasons.append(f"suspicious command-line patterns: {', '.join(matched_patterns)}")
+
+    # Network behavior
+    try:
+        conns = proc.net_connections(kind="inet")  # type: ignore[arg-type]
+    except psutil.AccessDenied:
+        try:
+            conns = [c for c in psutil.net_connections(kind="inet") if c.pid == proc.pid]
+        except Exception:
+            conns = []
+    except psutil.NoSuchProcess:
+        return None
+
+    outbound_count = 0
+    c2_matches = []
+
+    for conn in conns:
+        if not conn.raddr:
+            continue
+
+        state = (conn.status or "").upper()
+        if state in {"LISTEN", "CLOSED"}:
+            continue
+
+        r_ip = conn.raddr.ip
+        r_port = conn.raddr.port
+        outbound_count += 1
+
+        if r_port == c2_port and (c2_host == "*" or r_ip == c2_host):
+            c2_matches.append(f"{r_ip}:{r_port}")
+
+    if is_ps and outbound_count > 0:
+        score += 2
+        reasons.append(f"PowerShell has outbound network activity ({outbound_count} connection(s))")
+
+    if is_ps and c2_matches:
+        score += 4
+        reasons.append(f"PowerShell connected to configured C2 target(s): {', '.join(c2_matches)}")
+
+    # Generic PowerShell command line plus network activity is suspicious in your lab.
+    if is_ps and cmdline.lower().endswith("powershell.exe") and outbound_count > 0:
+        score += 2
+        reasons.append("generic PowerShell command line with outbound network behavior")
+
+    if score >= 4:
+        severity = "HIGH" if score >= 6 else "MEDIUM"
+        return Detection(
+            pid=proc.pid,
+            process_name=proc.name(),
+            severity=severity,
+            reason=f"Behavior score {score}: " + "; ".join(reasons),
+            cmdline=cmdline,
+        )
+
+    return None
 
 def iter_processes() -> Iterable[psutil.Process]:
     """Safely iterate over processes."""
@@ -276,7 +392,13 @@ def print_detection(det: Detection) -> None:
     print()
 
 
-def monitor(c2_host: str, c2_port: int, interval: float = 5.0, debug: bool = False) -> None:
+def monitor(
+    c2_host: str,
+    c2_port: int,
+    interval: float = 5.0,
+    debug: bool = False,
+    autodetect_c2: bool = True,
+) -> None:
     """Continuously monitor for suspicious behavior.
 
     - Looks for suspicious PowerShell command lines
@@ -316,12 +438,33 @@ def monitor(c2_host: str, c2_port: int, interval: float = 5.0, debug: bool = Fal
                     continue
 
                 # 2) Connection to C2
-                det2 = detect_c2_connections(proc, c2_host=c2_host, c2_port=c2_port)
+                # If we're monitoring PowerShell and the simulation specifies a C2,
+                # prefer that as a per-process target. This avoids requiring users to
+                # hardcode IPs in the detector.
+                host_eff = c2_host
+                port_eff = c2_port
+                if autodetect_c2 and is_powershell_process(proc):
+                    h2, p2 = parse_c2_from_cmdline(cmdline)
+                    if h2:
+                        host_eff = h2
+                    if p2:
+                        port_eff = p2
+
+                det2 = detect_c2_connections(proc, c2_host=host_eff, c2_port=port_eff)
                 if det2:
                     # Only print if this is a new detection for this process
                     if seen.get(proc.pid) != cmdline:
                         print_detection(det2)
                         seen[proc.pid] = cmdline
+                    continue
+
+                # 3) Behavior score detection
+                det3 = score_process_behavior(proc, c2_host=host_eff, c2_port=port_eff)
+                if det3:
+                    detection_key = f"{cmdline}|{det3.reason}"
+                    if seen.get(proc.pid) != detection_key:
+                        print_detection(det3)
+                        seen[proc.pid] = detection_key
                     continue
             
             # Debug output: show PowerShell processes found
@@ -371,10 +514,27 @@ def monitor(c2_host: str, c2_port: int, interval: float = 5.0, debug: bool = Fal
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Behavior-based fileless malware detector")
-    parser.add_argument("--c2-host", default=DEFAULT_C2_HOST, help="C2 host/IP to watch (use '*' for any IP, default: 127.0.0.1)")
-    parser.add_argument("--c2-port", type=int, default=DEFAULT_C2_PORT, help="C2 port to watch (default: 8080)")
-    parser.add_argument("--interval", type=float, default=5.0, help="Polling interval in seconds (default: 5.0)")
+    parser.add_argument(
+        "--c2-host",
+        default=DEFAULT_C2_HOST,
+        help=(
+            "C2 host/IP to watch (use '*' for any IP). Default is '*' to support a separate C2 VM. "
+            "You can also set IT359_C2_HOST env var."
+        ),
+    )
+    parser.add_argument(
+        "--c2-port",
+        type=int,
+        default=DEFAULT_C2_PORT,
+        help="C2 port to watch (default: 8080; can also set IT359_C2_PORT env var)",
+    )
+    parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds (default: 1.0)")
     parser.add_argument("--debug", action="store_true", help="Enable debug output to see all PowerShell processes")
+    parser.add_argument(
+        "--no-autodetect-c2",
+        action="store_true",
+        help="Disable per-process C2 host/port autodetection from PowerShell cmdline",
+    )
     return parser.parse_args()
 
 
@@ -388,7 +548,13 @@ def main() -> None:
         print(f"[!] psutil error: {exc}")
         sys.exit(1)
 
-    monitor(c2_host=args.c2_host, c2_port=args.c2_port, interval=args.interval, debug=args.debug)
+    monitor(
+        c2_host=args.c2_host,
+        c2_port=args.c2_port,
+        interval=args.interval,
+        debug=args.debug,
+        autodetect_c2=not args.no_autodetect_c2,
+    )
 
 
 if __name__ == "__main__":
