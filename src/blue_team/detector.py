@@ -135,16 +135,19 @@ def detect_c2_connections(proc: psutil.Process, c2_host: str, c2_port: int) -> O
             return None
 
     cmdline = get_cmdline(proc)
+
     for conn in conns:
         if not conn.raddr:
             continue
+
         # Skip listeners/closed sockets; keep established-ish outbound states.
-        # psutil uses OS strings; normalize to upper.
         state = (conn.status or "").upper()
         if state and state in {"LISTEN", "CLOSED"}:
             continue
-    r_ip, r_port = conn.raddr.ip, conn.raddr.port
-    if r_port == c2_port and (c2_host == "*" or r_ip == c2_host):
+
+        r_ip, r_port = conn.raddr.ip, conn.raddr.port
+
+        if r_port == c2_port and (c2_host == "*" or r_ip == c2_host):
             severity = "HIGH" if is_powershell_process(proc) else "MEDIUM"
             return Detection(
                 pid=proc.pid,
