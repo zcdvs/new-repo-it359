@@ -69,7 +69,7 @@ def _compile_regex_list(raw: str) -> List[re.Pattern[str]]:
 
 
 def get_config() -> DetectorConfig:
-    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "10"))
+    poll_seconds = float(os.getenv("ML_DETECTOR_POLL_SECONDS", "1"))
     debug = get_env_bool("ML_DETECTOR_DEBUG", False)
 
     # Always-on monitor: we still use a local score to decide when to call the model.
@@ -97,8 +97,8 @@ def get_config() -> DetectorConfig:
         poll_seconds=poll_seconds,
         debug=debug,
         min_score_for_ai=min_score_for_ai,
-    max_ai_per_cycle=max_ai_per_cycle,
-    throttle_seconds=throttle_seconds,
+        max_ai_per_cycle=max_ai_per_cycle,
+        throttle_seconds=throttle_seconds,
         write_alert_log=write_alert_log,
         alert_log_path=alert_log_path,
         ai_verbose=ai_verbose,
@@ -491,7 +491,7 @@ def compute_beacon_likeness(
 
     # Avoid overreacting to very small sample windows.
     span = float(max(timestamps) - min(timestamps)) if timestamps else 0.0
-    if span < float(os.getenv("ML_DETECTOR_BEACON_MIN_WINDOW_SECONDS", "30")):
+    if span < float(os.getenv("ML_DETECTOR_BEACON_MIN_WINDOW_SECONDS", "10")):
         return 0, reasons
 
     mean_i, jitter = _interval_stats(timestamps)
@@ -701,7 +701,7 @@ def main():
     # - ML_DETECTOR_MONITOR_MIN_SCORE sets minimum local score to print.
     # - ML_DETECTOR_MONITOR_PRINT_POWERSHELL=1 prints PowerShell even at low score.
     # - ML_DETECTOR_MONITOR_PRINT_NETONLY=1 prints any process with conn_count>0 even if score is low.
-    print_monitor = get_env_bool("ML_DETECTOR_PRINT_MONITOR", False)
+    print_monitor = get_env_bool("ML_DETECTOR_PRINT_MONITOR", True)
     monitor_min_score = int(os.getenv("ML_DETECTOR_MONITOR_MIN_SCORE", "2"))
     monitor_print_powershell = get_env_bool("ML_DETECTOR_MONITOR_PRINT_POWERSHELL", True)
     monitor_print_netonly = get_env_bool("ML_DETECTOR_MONITOR_PRINT_NETONLY", False)
@@ -737,9 +737,9 @@ def main():
 
     # Per-PID time series used for beacon-likeness scoring.
     # Stores only recent samples to keep memory bounded.
-    beacon_history_seconds = float(os.getenv("ML_DETECTOR_BEACON_WINDOW_SECONDS", "120"))
+    beacon_history_seconds = float(os.getenv("ML_DETECTOR_BEACON_WINDOW_SECONDS", "30"))
     # Require more samples by default to reduce false positives from short observation windows.
-    beacon_min_samples = int(os.getenv("ML_DETECTOR_BEACON_MIN_SAMPLES", "6"))
+    beacon_min_samples = int(os.getenv("ML_DETECTOR_BEACON_MIN_SAMPLES", "3"))
     # pid -> deque of (timestamp, conn_count, remotes)
     beacon_hist: Dict[int, Deque[Tuple[float, int, List[str]]]] = {}
 
@@ -833,7 +833,7 @@ def main():
                 features["beacon_reasons"] = []
                 allow_beacon_calc = (not beacon_only_powershell) or is_powershell_family(proc)
                 # Only consider EXTERNAL endpoints for beaconing; loopback periodicity is normal IPC.
-                if allow_beacon_calc and len(external_eps) > 0:
+                if allow_beacon_calc:
                     now_ts = time.time()
                     dq = beacon_hist.get(pid_val)
                     if dq is None:
@@ -977,7 +977,7 @@ def main():
                 if x.strip()
             }
             proc_name_l = (str(features.get("name") or "")).lower()
-            
+
             if proc_name_l in core_proc_names and not is_ps:
                 # Only allow if we have a high beacon score AND at least one external endpoint,
                 # or if the local heuristic score is meaningfully higher than the default threshold.
