@@ -436,6 +436,26 @@ def count_remote_connections(pid: int) -> Tuple[int, List[str]]:
     return len(remotes_unique), remotes_unique
 
 
+def _is_loopback_ip(ip: Optional[str]) -> bool:
+    if not ip:
+        return False
+    ip = ip.strip().lower()
+    return ip.startswith("127.") or ip in {"::1", "localhost"}
+
+
+def split_endpoints(remotes: List[str]) -> Tuple[List[str], List[str]]:
+    """Split endpoints into (loopback, external)."""
+    loopback: List[str] = []
+    external: List[str] = []
+    for ep in remotes or []:
+        ip = ep.split(":")[0].strip() if ep else ""
+        if _is_loopback_ip(ip):
+            loopback.append(ep)
+        else:
+            external.append(ep)
+    return sorted(set(loopback)), sorted(set(external))
+
+
 def _interval_stats(ts: List[float]) -> Tuple[Optional[float], Optional[float]]:
     """Return (mean_interval, jitter) for a timestamp series.
 
@@ -653,6 +673,21 @@ def main():
     write_alert_log = cfg.write_alert_log
     alert_log_path = cfg.alert_log_path
 
+    # Reduce common benign noise on Windows (browsers/child content processes).
+    # These can have loopback IPC connections and long cmdlines that otherwise cause
+    # frequent AI escalations.
+    suppress_ai_process_names = {
+        x.strip().lower()
+        for x in _split_csv(
+            os.getenv(
+                "ML_DETECTOR_SUPPRESS_AI_PROCESS_NAMES",
+                "chrome.exe,msedge.exe,firefox.exe,brave.exe,opera.exe"
+            )
+        )
+        if x.strip()
+    }
+    suppress_ai_requires_external = get_env_bool("ML_DETECTOR_SUPPRESS_AI_REQUIRES_EXTERNAL", True)
+
     # Console output tuning (defaults chosen to reduce benign noise):
     # - ML_DETECTOR_PRINT_MONITOR=1 enables per-process monitor lines.
     # - ML_DETECTOR_MONITOR_MIN_SCORE sets minimum local score to print.
@@ -688,6 +723,9 @@ def main():
     # Re-check a (pid, cmdline) at most every N seconds.
     throttle_seconds = cfg.throttle_seconds
     last_checked: Dict[Tuple[int, int], float] = {}
+    # If the model call fails, apply a longer cooldown to avoid noisy retries.
+    ai_error_cooldown_seconds = float(os.getenv("ML_DETECTOR_AI_ERROR_COOLDOWN_SECONDS", "180"))
+    last_ai_error: Dict[Tuple[int, int], float] = {}
 
     # Per-PID time series used for beacon-likeness scoring.
     # Stores only recent samples to keep memory bounded.
@@ -752,6 +790,8 @@ def main():
             pid_val = features.get("pid")
             conn_count = 0
             remotes: List[str] = []
+            loopback_eps: List[str] = []
+            external_eps: List[str] = []
             if isinstance(pid_val, int) and pid_val > 0:
                 # On Windows this can throw AccessDenied/NoSuchProcess mid-iteration.
                 try:
@@ -759,14 +799,18 @@ def main():
                 except Exception:
                     conn_count, remotes = 0, []
 
+                loopback_eps, external_eps = split_endpoints(remotes)
+
                 # Treat outbound networking as *some* signal, and stronger when PowerShell is involved.
                 is_ps_for_net = is_powershell_family(proc)
-                if conn_count > 0:
+                # IMPORTANT: loopback-only activity is common in browsers (IPC) and shouldn't
+                # trigger escalation by itself.
+                if len(external_eps) > 0:
                     score += 1
-                    reasons.append("outbound network activity")
+                    reasons.append("external outbound network activity")
                     if is_ps_for_net:
                         score += 2
-                        reasons.append("PowerShell outbound network activity")
+                        reasons.append("PowerShell external outbound network activity")
                     features["local_score"] = score
                     features["local_reasons"] = reasons
 
@@ -778,13 +822,14 @@ def main():
                 features["beacon_likeness"] = 0
                 features["beacon_reasons"] = []
                 allow_beacon_calc = (not beacon_only_powershell) or is_powershell_family(proc)
-                if allow_beacon_calc and conn_count > 0 and remotes:
+                # Only consider EXTERNAL endpoints for beaconing; loopback periodicity is normal IPC.
+                if allow_beacon_calc and len(external_eps) > 0:
                     now_ts = time.time()
                     dq = beacon_hist.get(pid_val)
                     if dq is None:
                         dq = deque(maxlen=200)
                         beacon_hist[pid_val] = dq
-                    dq.append((now_ts, int(conn_count), list(remotes)))
+                    dq.append((now_ts, int(len(external_eps)), list(external_eps)))
 
                     cutoff = now_ts - beacon_history_seconds
                     while dq and dq[0][0] < cutoff:
@@ -825,6 +870,9 @@ def main():
 
             features["remote_connection_count"] = conn_count
             features["remote_endpoints"] = remotes
+            features["loopback_endpoints"] = loopback_eps
+            features["external_endpoints"] = external_eps
+            features["external_connection_count"] = len(external_eps)
 
             # Optional: add a low-cost "suspicious cmdline" hint.
             # If this is false and the score is low, it's likely benign.
@@ -871,6 +919,15 @@ def main():
             cmd_hash2 = hash(features.get("cmdline") or "")
             throttle_key = (pid_i, cmd_hash2)
             now = time.time()
+
+            last_err = last_ai_error.get(throttle_key)
+            if last_err is not None and (now - last_err) < ai_error_cooldown_seconds:
+                if debug:
+                    print(
+                        f"[debug] ai-error-cooldown pid={pid_i} ({int(now - last_err)}s since last error)"
+                    )
+                continue
+
             last = last_checked.get(throttle_key)
             if last is not None and (now - last) < throttle_seconds:
                 if debug:
@@ -886,7 +943,7 @@ def main():
             # up in cmdline-based scoring.
             ai_threshold = min_score_for_ai
             if is_ps:
-                if int(features.get("remote_connection_count") or 0) > 0 or int(features.get("beacon_likeness") or 0) >= 3:
+                if int(features.get("external_connection_count") or 0) > 0 or int(features.get("beacon_likeness") or 0) >= 3:
                     ai_threshold = min(ai_threshold, ps_min_score_for_ai)
 
             if score < ai_threshold:
@@ -896,6 +953,24 @@ def main():
                         f"score={score} threshold={ai_threshold} reasons={reasons} cmdline_high_signal={features.get('cmdline_high_signal')}"
                     )
                 continue
+
+            # Additional guardrail: suppress AI escalation for common noisy processes
+            # unless there's external network activity or a stronger local score.
+            proc_name_l = (str(features.get("name") or "")).lower()
+            if proc_name_l in suppress_ai_process_names:
+                has_external = int(features.get("external_connection_count") or 0) > 0
+                if (not suppress_ai_requires_external) or has_external:
+                    # allow through
+                    pass
+                else:
+                    # Require more than the bare minimum score to avoid constant Firefox noise.
+                    extra_min = int(os.getenv("ML_DETECTOR_SUPPRESS_AI_MIN_SCORE", "4"))
+                    if score < extra_min:
+                        if debug:
+                            print(
+                                f"[debug] suppress-ai pid={features.get('pid')} name={features.get('name')} score={score}"
+                            )
+                        continue
 
             escalated_to_ai_count += 1
             if escalated_to_ai_count > max_ai_per_cycle:
@@ -916,6 +991,11 @@ def main():
                 pid_explanation = parsed.get("process_id_explanation")
                 if isinstance(parsed.get("reasons"), list):
                     model_reasons = [str(x) for x in parsed.get("reasons") if x is not None]
+
+            # If the AI call failed (we synthesize a JSON response with model_call_failed),
+            # cool down retries for this (pid, cmdline).
+            if model_reasons and any("model_call_failed" in r for r in model_reasons):
+                last_ai_error[throttle_key] = time.time()
 
             # Step 5: Print only actionable items in quiet mode.
             final_score = int(features.get("local_score") or score)
