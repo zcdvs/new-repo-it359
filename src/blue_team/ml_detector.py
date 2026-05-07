@@ -73,12 +73,12 @@ def get_config() -> DetectorConfig:
     debug = get_env_bool("ML_DETECTOR_DEBUG", False)
 
     # Always-on monitor: we still use a local score to decide when to call the model.
-    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "3"))
+    min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "2"))
     # PowerShell often runs in-process scriptblocks with a bland cmdline; allow a lower
     # threshold so your fileless demo can still escalate to AI.
     # (Used in main loop; not part of DetectorConfig to keep the struct stable.)
     max_ai_per_cycle = int(os.getenv("ML_DETECTOR_MAX_AI_PER_CYCLE", "4"))
-    throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "30"))
+    throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "15"))
 
     ai_verbose = get_env_bool("ML_DETECTOR_AI_VERBOSE", False)
     ai_print_pid_expl = get_env_bool("ML_DETECTOR_AI_PRINT_PID_EXPLANATION", False)
