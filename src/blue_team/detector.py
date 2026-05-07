@@ -18,13 +18,21 @@ from __future__ import annotations
 
 import argparse
 import os
+import platform
 import re
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import psutil
+
+# Optional Windows-specific registry access
+try:
+    import winreg
+except Exception:
+    winreg = None
 
 # Default values should match the C2 listener defaults.
 # NOTE: In the recommended lab topology the C2 listener runs on a separate VM.
@@ -35,12 +43,12 @@ DEFAULT_C2_PORT = int(os.getenv("IT359_C2_PORT", "8080"))
 
 
 SUSPICIOUS_POWERSHELL_PATTERNS: List[re.Pattern[str]] = [
-    re.compile(r"-nop", re.IGNORECASE),
-    re.compile(r"-noprofile", re.IGNORECASE),
     re.compile(r"-w\s*hidden", re.IGNORECASE),
     re.compile(r"-windowstyle\s*hidden", re.IGNORECASE),
     re.compile(r"-enc(odedcommand)?", re.IGNORECASE),
     re.compile(r"invoke-expression|iex", re.IGNORECASE),
+    re.compile(r"fileless_simulation\.ps1", re.IGNORECASE),
+    re.compile(r"-C2Server", re.IGNORECASE),
 ]
 
 POWERSHELL_NAMES: Set[str] = {"powershell.exe", "powershell", "pwsh.exe", "pwsh"}
@@ -159,6 +167,134 @@ def detect_c2_connections(proc: psutil.Process, c2_host: str, c2_port: int) -> O
     return None
 
 
+def _parse_ip_port(addr: str) -> (Optional[str], Optional[int]):
+    """Parse address like 127.0.0.1:8080 or [::1]:8080 into (ip, port)."""
+    if not addr:
+        return None, None
+    addr = addr.strip()
+    # Handle [::1]:8080
+    if addr.startswith('[') and ']' in addr:
+        ip = addr[1:addr.index(']')]
+        rest = addr.split(']')[-1]
+        if rest.startswith(':'):
+            try:
+                return ip, int(rest[1:])
+            except Exception:
+                return ip, None
+        return ip, None
+    # IPv4 or IPv6 without brackets
+    parts = addr.rsplit(':', 1)
+    if len(parts) == 2:
+        ip, port = parts[0], parts[1]
+        try:
+            return ip, int(port)
+        except Exception:
+            return ip, None
+    return addr, None
+
+
+def find_pids_by_netstat(c2_host: str, c2_port: int) -> Set[int]:
+    """Return a set of PIDs with connections to c2_host:c2_port using netstat/ss as a fallback.
+
+    Works without psutil connection privileges in many environments.
+    """
+    pids: Set[int] = set()
+    try:
+        system = platform.system().lower()
+        if system.startswith('win'):
+            out = subprocess.check_output(["netstat", "-ano"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                parts = line.split()
+                if not parts:
+                    continue
+                if parts[0] not in ("TCP", "UDP"):
+                    continue
+                # Windows: TCP LocalAddress ForeignAddress State PID
+                if parts[0] == 'UDP':
+                    if len(parts) < 4:
+                        continue
+                    foreign = parts[2]
+                    pid = parts[-1]
+                else:
+                    if len(parts) < 5:
+                        continue
+                    foreign = parts[2]
+                    pid = parts[-1]
+
+                ip, port = _parse_ip_port(foreign)
+                if port is None:
+                    continue
+                if port == c2_port and (c2_host == '*' or c2_host == ip or (c2_host == '127.0.0.1' and ip in ('127.0.0.1', '::1'))):
+                    try:
+                        pid_int = int(pid)
+                        if pid_int > 0:
+                            pids.add(pid_int)
+                    except Exception:
+                        continue
+        else:
+            # Try ss then netstat on Unix-like systems
+            try:
+                out = subprocess.check_output(["ss", "-ntp"], text=True, stderr=subprocess.DEVNULL)
+            except Exception:
+                out = subprocess.check_output(["netstat", "-ntp"], text=True, stderr=subprocess.DEVNULL)
+            for line in out.splitlines():
+                if f':{c2_port}' not in line:
+                    continue
+                # attempt to extract pid=NNN or last token with pid
+                m = re.search(r'pid=(\d+)', line)
+                if m:
+                    try:
+                        pid_int = int(m.group(1))
+                        if pid_int > 0:
+                            pids.add(pid_int)
+                    except Exception:
+                        pass
+                else:
+                    # fallback: look for a number in parentheses like users:("proc",pid,fd)
+                    m2 = re.search(r'\b(\d{2,6})\b', line)
+                    if m2:
+                        try:
+                            pid_int = int(m2.group(1))
+                            if pid_int > 0:
+                                pids.add(pid_int)
+                        except Exception:
+                            pass
+    except Exception:
+        # non-fatal fallback
+        pass
+    return pids
+
+
+def detect_registry_persistence(seen: Dict[str, str]) -> None:
+    """Detect Run key persistence for DemoApp (HKCU)."""
+    if winreg is None:
+        return
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\\Microsoft\\Windows\\CurrentVersion\\Run") as key:
+            try:
+                val, _ = winreg.QueryValueEx(key, 'DemoApp')
+                if val and seen.get('registry') != val:
+                    det = Detection(pid=0, process_name='registry', severity='MEDIUM', reason='Run key DemoApp present', cmdline=str(val))
+                    print_detection(det)
+                    seen['registry'] = val
+            except FileNotFoundError:
+                return
+    except Exception:
+        return
+
+
+def detect_artifact_files(seen: Dict[str, str]) -> None:
+    """Detect marker files the simulation may create in Live mode."""
+    candidates = [r'C:\\temp\\execution_marker.txt', os.path.join(os.path.expanduser('~'), 'Desktop', 'HI.txt')]
+    for path in candidates:
+        try:
+            if os.path.exists(path) and seen.get(path) != 'exists':
+                det = Detection(pid=0, process_name='file', severity='LOW', reason=f'Artifact found: {path}', cmdline='')
+                print_detection(det)
+                seen[path] = 'exists'
+        except Exception:
+            continue
+
 def score_process_behavior(proc: psutil.Process, c2_host: str, c2_port: int) -> Optional[Detection]:
     """Score process behavior instead of relying on one perfect indicator."""
     score = 0
@@ -234,7 +370,6 @@ def score_process_behavior(proc: psutil.Process, c2_host: str, c2_port: int) -> 
         )
 
     return None
-
 
 def iter_processes() -> Iterable[psutil.Process]:
     """Safely iterate over processes."""
@@ -339,6 +474,38 @@ def monitor(
                     for pid, name, cmd in powershell_procs:
                         print(f"  - PID {pid} ({name}): {cmd[:80]}..." if len(cmd) > 80 else f"  - PID {pid} ({name}): {cmd}")
                     print()
+
+            # Fallback netstat-based detection for C2 connections (works without psutil net permissions)
+            try:
+                netstat_pids = find_pids_by_netstat(c2_host, c2_port)
+                for pid in netstat_pids:
+                    key = f'netstat:{c2_host}:{c2_port}'
+                    if seen.get(pid) != key:
+                        try:
+                            proc = psutil.Process(pid)
+                            name = proc.name()
+                            cmdline = get_cmdline(proc)
+                        except Exception:
+                            name = str(pid)
+                            cmdline = ''
+                        severity = 'HIGH' if name.lower() in POWERSHELL_NAMES else 'MEDIUM'
+                        det = Detection(pid=pid, process_name=name, severity=severity, reason=f"Netstat: connection to C2 {c2_host}:{c2_port}", cmdline=cmdline)
+                        print_detection(det)
+                        seen[pid] = key
+            except Exception:
+                pass
+
+            # Registry persistence check (HKCU Run DemoApp)
+            try:
+                detect_registry_persistence(seen)
+            except Exception:
+                pass
+
+            # Detect artifact files that may be written in Live mode
+            try:
+                detect_artifact_files(seen)
+            except Exception:
+                pass
 
             time.sleep(interval)
     except KeyboardInterrupt:
