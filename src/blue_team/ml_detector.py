@@ -74,6 +74,9 @@ def get_config() -> DetectorConfig:
 
     # Always-on monitor: we still use a local score to decide when to call the model.
     min_score_for_ai = int(os.getenv("ML_DETECTOR_MIN_SCORE", "3"))
+    # PowerShell often runs in-process scriptblocks with a bland cmdline; allow a lower
+    # threshold so your fileless demo can still escalate to AI.
+    # (Used in main loop; not part of DetectorConfig to keep the struct stable.)
     max_ai_per_cycle = int(os.getenv("ML_DETECTOR_MAX_AI_PER_CYCLE", "4"))
     throttle_seconds = float(os.getenv("ML_DETECTOR_THROTTLE_SECONDS", "30"))
 
@@ -581,6 +584,7 @@ def main():
     # - we call AI only for suspicious processes (local score or beacon-likeness)
     poll_seconds = cfg.poll_seconds
     min_score_for_ai = cfg.min_score_for_ai
+    ps_min_score_for_ai = int(os.getenv("ML_DETECTOR_PS_MIN_SCORE", "1"))
     max_ai_per_cycle = cfg.max_ai_per_cycle
     debug = cfg.debug
 
@@ -681,41 +685,43 @@ def main():
                 # Beacon-likeness (rate-based) — doesn't rely on a fixed C2 IP.
                 # We score based on periodic connection behavior for processes
                 # that exhibit outbound network activity.
-                now_ts = time.time()
-                dq = beacon_hist.get(pid_val)
-                if dq is None:
-                    dq = deque(maxlen=200)
-                    beacon_hist[pid_val] = dq
-                dq.append((now_ts, int(conn_count), list(remotes)))
+                # IMPORTANT: only track samples when we actually saw a remote endpoint.
+                # Otherwise, many long-running services look artificially "periodic" at poll rate.
+                features["beacon_likeness"] = 0
+                features["beacon_reasons"] = []
+                if conn_count > 0 and remotes:
+                    now_ts = time.time()
+                    dq = beacon_hist.get(pid_val)
+                    if dq is None:
+                        dq = deque(maxlen=200)
+                        beacon_hist[pid_val] = dq
+                    dq.append((now_ts, int(conn_count), list(remotes)))
 
-                cutoff = now_ts - beacon_history_seconds
-                while dq and dq[0][0] < cutoff:
-                    dq.popleft()
+                    cutoff = now_ts - beacon_history_seconds
+                    while dq and dq[0][0] < cutoff:
+                        dq.popleft()
 
-                if len(dq) >= beacon_min_samples:
-                    ts = [x[0] for x in dq]
-                    counts = [x[1] for x in dq]
-                    rem_series = [x[2] for x in dq]
-                    bl_score, bl_reasons = compute_beacon_likeness(
-                        timestamps=ts,
-                        remote_counts=counts,
-                        remote_endpoints=rem_series,
-                    )
-                    features["beacon_likeness"] = bl_score
-                    features["beacon_reasons"] = bl_reasons
+                    if len(dq) >= beacon_min_samples:
+                        ts = [x[0] for x in dq]
+                        counts = [x[1] for x in dq]
+                        rem_series = [x[2] for x in dq]
+                        bl_score, bl_reasons = compute_beacon_likeness(
+                            timestamps=ts,
+                            remote_counts=counts,
+                            remote_endpoints=rem_series,
+                        )
+                        features["beacon_likeness"] = bl_score
+                        features["beacon_reasons"] = bl_reasons
 
-                    # Beacon-likeness should be a meaningful escalation signal.
-                    if bl_score >= 6:
-                        score += 3
-                        reasons.append("beacon-like timing")
-                    elif bl_score >= 3:
-                        score += 1
-                        reasons.append("possible beacon timing")
-                    features["local_score"] = score
-                    features["local_reasons"] = reasons
-                else:
-                    features["beacon_likeness"] = 0
-                    features["beacon_reasons"] = []
+                        # Beacon-likeness should be a meaningful escalation signal.
+                        if bl_score >= 6:
+                            score += 3
+                            reasons.append("beacon-like timing")
+                        elif bl_score >= 3:
+                            score += 1
+                            reasons.append("possible beacon timing")
+                        features["local_score"] = score
+                        features["local_reasons"] = reasons
 
             features["remote_connection_count"] = conn_count
             features["remote_endpoints"] = remotes
@@ -755,11 +761,19 @@ def main():
             last_checked[throttle_key] = now
 
             # Step 4: AI escalation threshold
-            if score < min_score_for_ai:
+            # PowerShell heuristics: allow lower scores to escalate if there's any
+            # networking or beacon-like timing, since scriptblock activity won't show
+            # up in cmdline-based scoring.
+            ai_threshold = min_score_for_ai
+            if is_ps:
+                if int(features.get("remote_connection_count") or 0) > 0 or int(features.get("beacon_likeness") or 0) >= 3:
+                    ai_threshold = min(ai_threshold, ps_min_score_for_ai)
+
+            if score < ai_threshold:
                 if debug:
                     print(
                         f"[debug] skip-ai pid={features.get('pid')} name={features.get('name')} "
-                        f"score={score} reasons={reasons} cmdline_high_signal={features.get('cmdline_high_signal')}"
+                        f"score={score} threshold={ai_threshold} reasons={reasons} cmdline_high_signal={features.get('cmdline_high_signal')}"
                     )
                 continue
 
