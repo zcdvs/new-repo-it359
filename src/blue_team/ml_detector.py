@@ -669,11 +669,20 @@ def main():
     ai_one_line = get_env_bool("ML_DETECTOR_AI_ONE_LINE", False)
     ai_wrap = int(os.getenv("ML_DETECTOR_AI_WRAP", "120"))
 
-    # Beacon false-positive tuning:
-    # Many background services have periodic network activity; by default we only compute
-    # beacon-likeness for PowerShell-family processes (most relevant to your fileless demo).
-    # Set ML_DETECTOR_BEACON_ONLY_POWERSHELL=0 to enable for all processes.
-    beacon_only_powershell = get_env_bool("ML_DETECTOR_BEACON_ONLY_POWERSHELL", True)
+    # Optional: print a single-line beacon alert when beacon-likeness is strong.
+    # This helps demos when AI is throttled/off and monitor lines are disabled.
+    print_beacon_alerts = get_env_bool("ML_DETECTOR_PRINT_BEACON_ALERTS", True)
+    beacon_alert_min = int(os.getenv("ML_DETECTOR_BEACON_ALERT_MIN", "8"))
+
+    # Beacon tuning (NO hardcoded IPs):
+    # We detect beaconing based on timing/jitter + repeated endpoints + connect/disconnect.
+    # To keep it usable in labs, we compute beacon-likeness for all processes by default,
+    # but you can tune how strongly it affects risk scoring.
+    beacon_only_powershell = get_env_bool("ML_DETECTOR_BEACON_ONLY_POWERSHELL", False)
+    beacon_boost_ps_min = int(os.getenv("ML_DETECTOR_BEACON_BOOST_PS_MIN", "3"))
+    beacon_boost_ps_strong = int(os.getenv("ML_DETECTOR_BEACON_BOOST_PS_STRONG", "6"))
+    beacon_boost_other_min = int(os.getenv("ML_DETECTOR_BEACON_BOOST_OTHER_MIN", "8"))
+    beacon_boost_other_strong = int(os.getenv("ML_DETECTOR_BEACON_BOOST_OTHER_STRONG", "9"))
 
     # Avoid hammering the same long-running process with AI.
     # Re-check a (pid, cmdline) at most every N seconds.
@@ -794,19 +803,23 @@ def main():
                         features["beacon_reasons"] = bl_reasons
 
                         # Beacon-likeness should be a meaningful escalation signal.
+                        # Keep thresholds configurable so you can reduce false positives without baselining IPs.
                         if is_powershell_family(proc):
-                            if bl_score >= 6:
+                            if bl_score >= beacon_boost_ps_strong:
                                 score += 3
                                 reasons.append("beacon-like timing")
-                            elif bl_score >= 3:
+                            elif bl_score >= beacon_boost_ps_min:
                                 score += 1
                                 reasons.append("possible beacon timing")
                         else:
-                            # Non-PS processes are much more likely to be legitimate background updaters.
-                            # Only add suspicion for very strong beacon-likeness.
-                            if bl_score >= 8:
-                                score += 2
-                                reasons.append("strong beacon-like timing")
+                            # Non-PS processes are more likely to be legitimate background updaters,
+                            # so default thresholds are higher.
+                            if bl_score >= beacon_boost_other_strong:
+                                score += 3
+                                reasons.append("beacon-like timing")
+                            elif bl_score >= beacon_boost_other_min:
+                                score += 1
+                                reasons.append("possible beacon timing")
                         features["local_score"] = score
                         features["local_reasons"] = reasons
 
