@@ -653,10 +653,12 @@ def print_detection(det: Detection) -> None:
     banner = "=" * 70
     print(banner)
     print(f"[DETECTION] Severity: {det.severity}")
-    print(f"  PID: {det.pid}")
+    if det.pid:
+        print(f"  PID: {det.pid}")
     print(f"  Process: {det.process_name}")
     print(f"  Reason: {det.reason}")
-    print(f"  Cmdline: {det.cmdline}")
+    if det.cmdline:
+        print(f"  Cmdline: {det.cmdline}")
     print(banner)
     print()
 
