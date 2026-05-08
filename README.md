@@ -1,12 +1,15 @@
+Demo Vid: https://youtu.be/t7mHeWgCzY0
 IT 359 Final Project — Spring 2026
 Fileless Malware: Attack Simulation & Detection
-This project explores fileless malware — a category of malware that operates entirely within a computer's RAM, writing nothing to disk. Because traditional antivirus solutions rely on file-based signature scanning, fileless malware evades them effectively. This project gives hands-on experience with both offensive (Red Team) and defensive (Blue Team) techniques.
 ---
+This project explores fileless malware — a category of malware that operates entirely within a computer's RAM, writing nothing to disk. Because traditional antivirus solutions rely on file-based signature scanning, fileless malware evades them effectively. This project gives hands-on experience with both offensive (Red Team) and defensive (Blue Team) techniques.
+
 Team: Hack the Blocks
 Member	Role
+---
 Zac Davis	Red Team / Simulation
 Caleb Clauson	Blue Team / Detection
----
+
 Project Structure
 ```
 ├── docs/
@@ -21,7 +24,6 @@ Project Structure
 │       └── ml_detector.py            # AI/ML-based detector (Gemini API)
 ├── .env
 ├── .gitignore
-├── example-ai-api-usage.js
 ├── README.md
 └── requirements.txt
 ```
@@ -118,6 +120,7 @@ Usage:
 python src/blue_team/ml_detector.py
 ```
 Environment variable tuning (optional):
+--
 Variable	Default	Description
 `ML_DETECTOR_POLL_SECONDS`	`1`	How often to scan processes
 `ML_DETECTOR_MIN_SCORE`	`2`	Minimum local score to escalate to AI
@@ -125,15 +128,16 @@ Variable	Default	Description
 `ML_DETECTOR_AI_VERBOSE`	`false`	Print full features and raw model output
 `ML_DETECTOR_WRITE_ALERT_LOG`	`false`	Write suspicious/malicious verdicts to a log file
 `ML_DETECTOR_DEBUG`	`false`	Enable verbose debug output
----
+
 Technologies Used
+--
 Category	Technologies
 Red Team	PowerShell 5.1+, Python 3.8+, Flask
 Blue Team	Python 3.8+, psutil, Scapy
 Packet Capture	Scapy, Npcap (Windows)
 AI / ML	Google Gemini API (`gemma-4-26b-a4b-it`) via `google-genai`
 Communication	HTTP, Flask
----
+
 Setup & Installation
 Prerequisites
 Windows 10/11 (PowerShell simulation requires Windows)
@@ -210,13 +214,13 @@ powershell -ExecutionPolicy Bypass -File src/red_team/fileless_simulation.ps1 -C
 # Live mode (executes techniques)
 powershell -ExecutionPolicy Bypass -File src/red_team/fileless_simulation.ps1 -LiveMode -C2Server <C2_IP>
 ```
----
+--
 ⚠️ Disclaimer
 This project is for EDUCATIONAL PURPOSES ONLY.
 Only run these scripts in isolated, controlled lab environments
 Never use on systems or networks without explicit written authorization
 This project is part of an academic course (IT 359) at Illinois State University
 The authors are not responsible for any misuse of the code or techniques demonstrated
----
+--
 License
 This project was created for academic purposes as part of IT 359 at Illinois State University, Spring 2026.
