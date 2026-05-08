@@ -16,3 +16,6 @@ requests>=2.26.0
 
 # Google Gemini API
 google-genai>=0.1.0
+
+# Packet capture for HTTP payload inspection (requires Npcap/tshark on Windows)
+scapy>=2.4.5
